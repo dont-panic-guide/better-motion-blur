@@ -1,3 +1,4 @@
+<!-- doc-type: product-features -->
 # 03 — Shutter Blur, Long-Exposure Trails, Color & Diagnostics
 
 Primary files: [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [CpuFallbackProcessor.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CpuFallbackProcessor.cpp)

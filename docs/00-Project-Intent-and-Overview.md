@@ -1,3 +1,4 @@
+<!-- doc-type: product-intent -->
 # 00 — Project Intent & Architecture Overview
 
 ## User Intent & Product Goals

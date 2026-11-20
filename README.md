@@ -1,3 +1,4 @@
+<!-- doc-type: product-features -->
 # BetterMotionBlur (OpenFX 1.4)
 
 GPU-accelerated OpenFX plugin (`BetterMotionBlur.ofx.bundle`) for **DaVinci Resolve** on Windows, built for:
@@ -11,6 +12,7 @@ GPU-accelerated OpenFX plugin (`BetterMotionBlur.ofx.bundle`) for **DaVinci Reso
 - [02 — Optical Flow & Caching](docs/02-Optical-Flow-and-Caching.md) — Pyramidal PatchMatch+LK, Neural proxy refinement (embedded GPU & external ONNX), canonical bidirectional LRU cache, and stream-keyed scratch pool.
 - [03 — Blur, Trails, Color & Diagnostics](docs/03-Blur-Trail-Color-and-Diagnostics.md) — Shutter blur synthesis, flow-bridged trail splatting, DW/I transfer math, and diagnostic views.
 - [04 — Lifecycle, Performance & Testing](docs/04-Lifecycle-Performance-and-Testing.md) — Windows DLL/CUDA/ORT unload safety, NVRTC compilation, and automated verification (`BetterMotionBlurTests.exe`).
+- [CHANGELOG.md](CHANGELOG.md) — Unreleased and pushed release history.
 
 ## Quick Build & Test (Windows)
 ```powershell

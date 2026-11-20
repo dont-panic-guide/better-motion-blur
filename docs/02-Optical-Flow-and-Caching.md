@@ -1,3 +1,4 @@
+<!-- doc-type: product-features -->
 # 02 — Optical Flow Engine & Caching Architecture
 
 Primary files: [CudaEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.h), [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [NeuralFlowEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.h), [NeuralFlowEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.cpp), [OnnxModelGenerator.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/OnnxModelGenerator.h), [FlowCache.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/FlowCache.h), [FlowCache.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/FlowCache.cpp)

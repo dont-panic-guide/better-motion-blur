@@ -1,3 +1,4 @@
+<!-- doc-type: product-features -->
 # 04 — Lifecycle, Performance & Verification
 
 Primary files: [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [NeuralFlowEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.cpp), [BetterMotionBlurPlugin.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/BetterMotionBlurPlugin.cpp), [TestRunner.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/tests/TestRunner.cpp)

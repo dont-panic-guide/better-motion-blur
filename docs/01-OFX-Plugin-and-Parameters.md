@@ -1,3 +1,4 @@
+<!-- doc-type: product-features -->
 # 01 — OFX Plugin Interface & Parameters
 
 Primary files: [BetterMotionBlurPlugin.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/BetterMotionBlurPlugin.h), [BetterMotionBlurPlugin.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/BetterMotionBlurPlugin.cpp), [CommonTypes.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CommonTypes.h)
