@@ -1,0 +1,2329 @@
+#include "CudaEngine.h"
+#include "NeuralFlowEngine.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+namespace bmb {
+
+namespace {
+
+// CUDA Driver API types & function signatures
+using CUresult = int;
+using CUdevice = int;
+using CUcontext = void*;
+using CUmodule = void*;
+using CUfunction = void*;
+using CUstream = void*;
+using CUdeviceptr = uint64_t;
+
+constexpr CUresult CUDA_SUCCESS_VAL = 0;
+constexpr int CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1;
+
+using FnCuInit = CUresult(__stdcall*)(unsigned int Flags);
+using FnCuDeviceGet = CUresult(__stdcall*)(CUdevice* device, int ordinal);
+using FnCuDeviceGetName = CUresult(__stdcall*)(char* name, int len, CUdevice dev);
+using FnCuDeviceGetAttribute = CUresult(__stdcall*)(int* pi, int attrib, CUdevice dev);
+using FnCuCtxGetCurrent = CUresult(__stdcall*)(CUcontext* pctx);
+using FnCuCtxCreate = CUresult(__stdcall*)(CUcontext* pctx, unsigned int flags, CUdevice dev);
+using FnCuCtxDestroy = CUresult(__stdcall*)(CUcontext ctx);
+using FnCuCtxSetCurrent = CUresult(__stdcall*)(CUcontext ctx);
+using FnCuModuleLoadDataEx = CUresult(__stdcall*)(CUmodule* module, const void* image, unsigned int numOptions, int* options, void** optionValues);
+using FnCuModuleUnload = CUresult(__stdcall*)(CUmodule hmod);
+using FnCuModuleGetFunction = CUresult(__stdcall*)(CUfunction* hfunc, CUmodule hmod, const char* name);
+using FnCuMemAlloc = CUresult(__stdcall*)(CUdeviceptr* dptr, size_t bytesize);
+using FnCuMemFree = CUresult(__stdcall*)(CUdeviceptr dptr);
+using FnCuMemcpyHtoDAsync = CUresult(__stdcall*)(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream hStream);
+using FnCuMemcpyDtoHAsync = CUresult(__stdcall*)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+using FnCuMemcpyDtoDAsync = CUresult(__stdcall*)(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+using FnCuMemsetD8Async = CUresult(__stdcall*)(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream);
+using FnCuLaunchKernel = CUresult(__stdcall*)(CUfunction f,
+                                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                              unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                              unsigned int sharedMemBytes, CUstream hStream,
+                                              void** kernelParams, void** extra);
+using FnCuStreamSynchronize = CUresult(__stdcall*)(CUstream hStream);
+
+// NVRTC types & function signatures
+using nvrtcResult = int;
+using nvrtcProgram = void*;
+constexpr nvrtcResult NVRTC_SUCCESS_VAL = 0;
+
+using FnNvrtcCreateProgram = nvrtcResult(__cdecl*)(nvrtcProgram* prog, const char* src, const char* name, int numHeaders, const char* const* headers, const char* const* includeNames);
+using FnNvrtcDestroyProgram = nvrtcResult(__cdecl*)(nvrtcProgram* prog);
+using FnNvrtcCompileProgram = nvrtcResult(__cdecl*)(nvrtcProgram prog, int numOptions, const char* const* options);
+using FnNvrtcGetPTXSize = nvrtcResult(__cdecl*)(nvrtcProgram prog, size_t* ptxSizeRet);
+using FnNvrtcGetPTX = nvrtcResult(__cdecl*)(nvrtcProgram prog, char* ptx);
+using FnNvrtcGetProgramLogSize = nvrtcResult(__cdecl*)(nvrtcProgram prog, size_t* logSizeRet);
+using FnNvrtcGetProgramLog = nvrtcResult(__cdecl*)(nvrtcProgram prog, char* log);
+
+struct CudaDriverTable {
+    FnCuInit cuInit = nullptr;
+    FnCuDeviceGet cuDeviceGet = nullptr;
+    FnCuDeviceGetName cuDeviceGetName = nullptr;
+    FnCuDeviceGetAttribute cuDeviceGetAttribute = nullptr;
+    FnCuCtxGetCurrent cuCtxGetCurrent = nullptr;
+    FnCuCtxCreate cuCtxCreate = nullptr;
+    FnCuCtxDestroy cuCtxDestroy = nullptr;
+    FnCuCtxSetCurrent cuCtxSetCurrent = nullptr;
+    FnCuModuleLoadDataEx cuModuleLoadDataEx = nullptr;
+    FnCuModuleUnload cuModuleUnload = nullptr;
+    FnCuModuleGetFunction cuModuleGetFunction = nullptr;
+    FnCuMemAlloc cuMemAlloc = nullptr;
+    FnCuMemFree cuMemFree = nullptr;
+    FnCuMemcpyHtoDAsync cuMemcpyHtoDAsync = nullptr;
+    FnCuMemcpyDtoHAsync cuMemcpyDtoHAsync = nullptr;
+    FnCuMemcpyDtoDAsync cuMemcpyDtoDAsync = nullptr;
+    FnCuMemsetD8Async cuMemsetD8Async = nullptr;
+    FnCuLaunchKernel cuLaunchKernel = nullptr;
+    FnCuStreamSynchronize cuStreamSynchronize = nullptr;
+
+    FnNvrtcCreateProgram nvrtcCreateProgram = nullptr;
+    FnNvrtcDestroyProgram nvrtcDestroyProgram = nullptr;
+    FnNvrtcCompileProgram nvrtcCompileProgram = nullptr;
+    FnNvrtcGetPTXSize nvrtcGetPTXSize = nullptr;
+    FnNvrtcGetPTX nvrtcGetPTX = nullptr;
+    FnNvrtcGetProgramLogSize nvrtcGetProgramLogSize = nullptr;
+    FnNvrtcGetProgramLog nvrtcGetProgramLog = nullptr;
+} g_cu;
+
+const char* kEmbeddedCudaSource = R"CUDA(
+extern "C" {
+
+__device__ __forceinline__ int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+__device__ __forceinline__ float clampf(float v, float lo, float hi) {
+    return fminf(hi, fmaxf(lo, v));
+}
+
+__device__ __forceinline__ float smoothstepf(float edge0, float edge1, float x) {
+    float t = clampf((x - edge0) / fmaxf(1e-6f, edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+#define DI_A       0.0075f
+#define DI_B       7.0f
+#define DI_C       0.07329248f
+#define DI_M       10.44426855f
+#define DI_LIN_CUT 0.00262409f
+#define DI_LOG_CUT 0.02740668f
+
+__device__ __forceinline__ float dwiToLinearChannel(float v) {
+    return (v <= DI_LOG_CUT) ? (v / DI_M) : (exp2f(v / DI_C - DI_B) - DI_A);
+}
+
+__device__ __forceinline__ float linearToDwiChannel(float l) {
+    return (l <= DI_LIN_CUT) ? (l * DI_M) : ((log2f(l + DI_A) + DI_B) * DI_C);
+}
+
+__device__ __forceinline__ float dwgLuminance(float r, float g, float b) {
+    return fmaxf(0.0f, 0.27411851f * r + 0.87363190f * g - 0.14775041f * b);
+}
+
+__device__ __forceinline__ float4 sampleRGBA_Bilinear(const float* img, int w, int h, float x, float y) {
+    float cx = clampf(x, 0.0f, (float)(w - 1));
+    float cy = clampf(y, 0.0f, (float)(h - 1));
+    int x0 = (int)floorf(cx);
+    int y0 = (int)floorf(cy);
+    int x1 = min(x0 + 1, w - 1);
+    int y1 = min(y0 + 1, h - 1);
+    float fx = cx - (float)x0;
+    float fy = cy - (float)y0;
+
+    const float4* img4 = (const float4*)img;
+    float4 p00 = __ldg(&img4[y0 * w + x0]);
+    float4 p10 = __ldg(&img4[y0 * w + x1]);
+    float4 p01 = __ldg(&img4[y1 * w + x0]);
+    float4 p11 = __ldg(&img4[y1 * w + x1]);
+
+    float w00 = (1.0f - fx) * (1.0f - fy);
+    float w10 = fx * (1.0f - fy);
+    float w01 = (1.0f - fx) * fy;
+    float w11 = fx * fy;
+
+    float4 r;
+    r.x = p00.x * w00 + p10.x * w10 + p01.x * w01 + p11.x * w11;
+    r.y = p00.y * w00 + p10.y * w10 + p01.y * w01 + p11.y * w11;
+    r.z = p00.z * w00 + p10.z * w10 + p01.z * w01 + p11.z * w11;
+    r.w = p00.w * w00 + p10.w * w10 + p01.w * w01 + p11.w * w11;
+    return r;
+}
+
+__device__ __forceinline__ float sampleFloat1_Bilinear(const float* img, int w, int h, float x, float y) {
+    float cx = clampf(x, 0.0f, (float)(w - 1));
+    float cy = clampf(y, 0.0f, (float)(h - 1));
+    int x0 = (int)floorf(cx);
+    int y0 = (int)floorf(cy);
+    int x1 = min(x0 + 1, w - 1);
+    int y1 = min(y0 + 1, h - 1);
+    float fx = cx - (float)x0;
+    float fy = cy - (float)y0;
+    float v00 = __ldg(&img[y0 * w + x0]);
+    float v10 = __ldg(&img[y0 * w + x1]);
+    float v01 = __ldg(&img[y1 * w + x0]);
+    float v11 = __ldg(&img[y1 * w + x1]);
+    return (v00 * (1.0f - fx) + v10 * fx) * (1.0f - fy) + (v01 * (1.0f - fx) + v11 * fx) * fy;
+}
+
+__device__ __forceinline__ float2 sampleFloat2_Bilinear(const float2* img, int w, int h, float x, float y) {
+    float cx = clampf(x, 0.0f, (float)(w - 1));
+    float cy = clampf(y, 0.0f, (float)(h - 1));
+    int x0 = (int)floorf(cx);
+    int y0 = (int)floorf(cy);
+    int x1 = min(x0 + 1, w - 1);
+    int y1 = min(y0 + 1, h - 1);
+    float fx = cx - (float)x0;
+    float fy = cy - (float)y0;
+
+    float2 v00 = __ldg(&img[y0 * w + x0]);
+    float2 v10 = __ldg(&img[y0 * w + x1]);
+    float2 v01 = __ldg(&img[y1 * w + x0]);
+    float2 v11 = __ldg(&img[y1 * w + x1]);
+
+    float w00 = (1.0f - fx) * (1.0f - fy);
+    float w10 = fx * (1.0f - fy);
+    float w01 = (1.0f - fx) * fy;
+    float w11 = fx * fy;
+
+    return make_float2(v00.x * w00 + v10.x * w10 + v01.x * w01 + v11.x * w11,
+                       v00.y * w00 + v10.y * w10 + v01.y * w01 + v11.y * w11);
+}
+
+__device__ __forceinline__ float2 readFlowVec(const float4* f4, int idx, int rev) {
+    float4 v = __ldg(&f4[idx]);
+    return rev ? make_float2(v.z, v.w) : make_float2(v.x, v.y);
+}
+
+__device__ __forceinline__ float readConfVal(const float2* c2, int idx, int rev) {
+    float2 v = __ldg(&c2[idx]);
+    return rev ? v.y : v.x;
+}
+
+__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
+    int* addr_as_i = (int*)addr;
+    int old = *addr_as_i;
+    int assumed;
+    while (__int_as_float(old) < val) {
+        assumed = old;
+        old = atomicCAS(addr_as_i, assumed, __float_as_int(val));
+        if (assumed == old) break;
+    }
+}
+
+__global__ void extractLumaAndMatteKernel(
+    int w, int h, const float* rgba, const float* matte, int matteComp,
+    float* outLuma, float* outMatte)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* rgba4 = (const float4*)rgba;
+    float4 p = __ldg(&rgba4[idx]);
+    outLuma[idx] = dwgLuminance(p.x, p.y, p.z);
+
+    if (outMatte) {
+        if (matte && matteComp > 0) {
+            if (matteComp == 1) {
+                outMatte[idx] = clampf(__ldg(&matte[idx]), 0.0f, 1.0f);
+            } else {
+                const float4* matte4 = (const float4*)matte;
+                float4 m = __ldg(&matte4[idx]);
+                float mv = (m.w > 0.0f && m.w < 0.9999f) ? m.w : (0.2126f * m.x + 0.7152f * m.y + 0.0722f * m.z);
+                outMatte[idx] = clampf(mv, 0.0f, 1.0f);
+            }
+        } else {
+            outMatte[idx] = 1.0f;
+        }
+    }
+}
+
+__global__ void downsample2xKernel(
+    int srcW, int srcH, int dstW, int dstH, const float* src, float* dst)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dstW || y >= dstH) return;
+
+    const float kw[4] = {0.125f, 0.375f, 0.375f, 0.125f};
+    int cx = x * 2;
+    int cy = y * 2;
+    float sum = 0.0f;
+    for (int dy = -1; dy <= 2; ++dy) {
+        int sy = clampi(cy + dy, 0, srcH - 1);
+        float wy = kw[dy + 1];
+        for (int dx = -1; dx <= 2; ++dx) {
+            int sx = clampi(cx + dx, 0, srcW - 1);
+            sum += wy * kw[dx + 1] * src[sy * srcW + sx];
+        }
+    }
+    dst[y * dstW + x] = sum;
+}
+
+__global__ void initZeroFlowKernel(int w, int h, float2* flow) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    flow[y * w + x] = make_float2(0.0f, 0.0f);
+}
+
+__global__ void upsampleFlow2xKernel(
+    int srcW, int srcH, int dstW, int dstH, const float2* srcFlow, float2* dstFlow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dstW || y >= dstH) return;
+
+    float sx = ((float)x + 0.5f) * ((float)srcW / (float)dstW) - 0.5f;
+    float sy = ((float)y + 0.5f) * ((float)srcH / (float)dstH) - 0.5f;
+    float scaleX = (float)dstW / (float)srcW;
+    float scaleY = (float)dstH / (float)srcH;
+
+    float2 f = sampleFloat2_Bilinear(srcFlow, srcW, srcH, sx, sy);
+    dstFlow[y * dstW + x] = make_float2(f.x * scaleX, f.y * scaleY);
+}
+
+// Coarse-to-Fine PatchMatch + Multi-Radius Search + Iterative Lucas-Kanade Kernel
+__device__ __forceinline__ float evalPatchCostShared(
+    int x, int y, int w, int h,
+    int baseX, int baseY, int mBaseX, int mBaseY,
+    const float sLumaA[22][22], const float sMatteA[20][20],
+    const float* lumaB,
+    int fgCenter, int hasMatte, float vx, float vy, float maxCost)
+{
+    float cost = 0.0f;
+    float wsum = 0.0f;
+    const float rvx = rintf(vx);
+    const float rvy = rintf(vy);
+    const bool isInt = (fabsf(vx - rvx) < 1e-4f) && (fabsf(vy - rvy) < 1e-4f);
+    const int ivx = (int)rvx;
+    const int ivy = (int)rvy;
+    const float maxSum = (!hasMatte && maxCost < 1e8f) ? (maxCost * 25.0f + 1e-3f) : 1e30f;
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        int ay = clampi(y + dy, 0, h - 1);
+        int syA = ay - baseY;
+        int smyA = ay - mBaseY;
+        for (int dx = -2; dx <= 2; ++dx) {
+            int ax = clampi(x + dx, 0, w - 1);
+            float a = sLumaA[syA][ax - baseX];
+            float diff;
+            if (isInt) {
+                int bx = ax + ivx;
+                int by = ay + ivy;
+                if (bx < 0 || bx >= w || by < 0 || by >= h) {
+                    diff = 0.25f;
+                } else {
+                    float b = __ldg(&lumaB[by * w + bx]);
+                    diff = fabsf(a - b);
+                }
+            } else {
+                float bx = (float)ax + vx;
+                float by = (float)ay + vy;
+                if (bx < 0.0f || bx > (float)(w - 1) || by < 0.0f || by > (float)(h - 1)) {
+                    diff = 0.25f;
+                } else {
+                    float b = sampleFloat1_Bilinear(lumaB, w, h, bx, by);
+                    diff = fabsf(a - b);
+                }
+            }
+            if (hasMatte) {
+                int fgN = (sMatteA[smyA][ax - mBaseX] >= 0.5f) ? 1 : 0;
+                float weight = (fgN != fgCenter) ? 0.05f : 1.0f;
+                cost += weight * diff;
+                wsum += weight;
+            } else {
+                cost += diff;
+                if (cost > maxSum) return 1e9f;
+            }
+        }
+    }
+    return hasMatte ? (cost / fmaxf(1e-4f, wsum)) : (cost * 0.04f);
+}
+
+__global__ void patchMatchLKFlowKernel(
+    int w, int h,
+    const float* lumaA, const float* matteA,
+    const float* lumaB,
+    const float2* inFlow, float2* outFlow,
+    int searchRadius, int lkIterations, int hasMatte)
+{
+    __shared__ float sLumaA[22][22];
+    __shared__ float sMatteA[20][20];
+
+    const int bx0 = (int)blockIdx.x * 16;
+    const int by0 = (int)blockIdx.y * 16;
+    const int baseX = bx0 - 3;
+    const int baseY = by0 - 3;
+    const int mBaseX = bx0 - 2;
+    const int mBaseY = by0 - 2;
+    const int tid = (int)threadIdx.y * 16 + (int)threadIdx.x;
+
+    for (int k = tid; k < 22 * 22; k += 256) {
+        int sy = k / 22;
+        int sx = k - sy * 22;
+        int gx = clampi(baseX + sx, 0, w - 1);
+        int gy = clampi(baseY + sy, 0, h - 1);
+        sLumaA[sy][sx] = __ldg(&lumaA[gy * w + gx]);
+    }
+    const int activeMatte = (hasMatte && matteA) ? 1 : 0;
+    if (activeMatte) {
+        for (int k = tid; k < 20 * 20; k += 256) {
+            int sy = k / 20;
+            int sx = k - sy * 20;
+            int gx = clampi(mBaseX + sx, 0, w - 1);
+            int gy = clampi(mBaseY + sy, 0, h - 1);
+            sMatteA[sy][sx] = __ldg(&matteA[gy * w + gx]);
+        }
+    }
+    __syncthreads();
+
+    int x = bx0 + (int)threadIdx.x;
+    int y = by0 + (int)threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    float mCenter = activeMatte ? sMatteA[(int)threadIdx.y + 2][(int)threadIdx.x + 2] : 1.0f;
+    int fgCenter = (mCenter >= 0.5f) ? 1 : 0;
+
+    float2 bestFlow = __ldg(&inFlow[y * w + x]);
+    float bestCost = evalPatchCostShared(
+        x, y, w, h, baseX, baseY, mBaseX, mBaseY,
+        sLumaA, sMatteA, lumaB, fgCenter, activeMatte, bestFlow.x, bestFlow.y, 1e9f);
+
+    // Zero candidate helps static background snap cleanly
+    bool testedZero = (fabsf(bestFlow.x) < 1e-4f && fabsf(bestFlow.y) < 1e-4f);
+    if (!testedZero) {
+        float c0 = evalPatchCostShared(
+            x, y, w, h, baseX, baseY, mBaseX, mBaseY,
+            sLumaA, sMatteA, lumaB, fgCenter, activeMatte, 0.0f, 0.0f, bestCost);
+        if (c0 + 1e-4f < bestCost) {
+            bestCost = c0;
+            bestFlow = make_float2(0.0f, 0.0f);
+        }
+    }
+
+    // Spatial neighbor propagation candidates (deduplicated against bestFlow / zero)
+    const int nOffsets[4][2] = {{-2, 0}, {2, 0}, {0, -2}, {0, 2}};
+    for (int i = 0; i < 4; ++i) {
+        int nx = clampi(x + nOffsets[i][0], 0, w - 1);
+        int ny = clampi(y + nOffsets[i][1], 0, h - 1);
+        float2 cand = __ldg(&inFlow[ny * w + nx]);
+        if (fabsf(cand.x - bestFlow.x) < 1e-4f && fabsf(cand.y - bestFlow.y) < 1e-4f) continue;
+        if (fabsf(cand.x) < 1e-4f && fabsf(cand.y) < 1e-4f) continue;
+        float c = evalPatchCostShared(
+            x, y, w, h, baseX, baseY, mBaseX, mBaseY,
+            sLumaA, sMatteA, lumaB, fgCenter, activeMatte, cand.x, cand.y, bestCost);
+        if (c + 1e-4f < bestCost) {
+            bestCost = c;
+            bestFlow = cand;
+        }
+    }
+
+    // Exhaustive 2D local search around base flow at coarse levels
+    if (searchRadius > 0) {
+        float2 base = bestFlow;
+        float regW = (searchRadius >= 2) ? 1.0e-4f : 0.0f;
+        float bestScore = bestCost + regW * (base.x * base.x + base.y * base.y);
+        for (int dy = -searchRadius; dy <= searchRadius; ++dy) {
+            for (int dx = -searchRadius; dx <= searchRadius; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                float cx = base.x + (float)dx;
+                float cy = base.y + (float)dy;
+                float regCost = regW * (cx * cx + cy * cy);
+                float maxAllowed = bestScore - regCost;
+                if (maxAllowed <= 0.0f) continue;
+                float c = evalPatchCostShared(
+                    x, y, w, h, baseX, baseY, mBaseX, mBaseY,
+                    sLumaA, sMatteA, lumaB, fgCenter, activeMatte, cx, cy, maxAllowed);
+                float score = c + regCost;
+                if (score + 1e-5f < bestScore) {
+                    bestScore = score;
+                    bestCost = c;
+                    bestFlow = make_float2(cx, cy);
+                }
+            }
+        }
+    }
+
+    // Sub-pixel Iterative Lucas-Kanade / Structure Tensor Refinement
+    float vx = bestFlow.x;
+    float vy = bestFlow.y;
+
+    if (lkIterations > 0) {
+        float valA[25];
+        float gxArr[25];
+        float gyArr[25];
+        float wArr[25];
+        float Ixx = 0.0f, Ixy = 0.0f, Iyy = 0.0f;
+        int k = 0;
+
+        for (int dy = -2; dy <= 2; ++dy) {
+            int ay = clampi(y + dy, 0, h - 1);
+            int sy = ay - baseY;
+            int sym = clampi(ay - 1, 0, h - 1) - baseY;
+            int syp = clampi(ay + 1, 0, h - 1) - baseY;
+            int smy = ay - mBaseY;
+            for (int dx = -2; dx <= 2; ++dx) {
+                int ax = clampi(x + dx, 0, w - 1);
+                int sx = ax - baseX;
+                int sxm = clampi(ax - 1, 0, w - 1) - baseX;
+                int sxp = clampi(ax + 1, 0, w - 1) - baseX;
+                float weight = (dx == 0 && dy == 0) ? 1.5f : 1.0f;
+                if (activeMatte) {
+                    int fgN = (sMatteA[smy][ax - mBaseX] >= 0.5f) ? 1 : 0;
+                    if (fgN != fgCenter) weight = 0.02f;
+                }
+                float gx = 0.5f * (sLumaA[sy][sxp] - sLumaA[sy][sxm]);
+                float gy = 0.5f * (sLumaA[syp][sx] - sLumaA[sym][sx]);
+                valA[k] = sLumaA[sy][sx];
+                gxArr[k] = gx;
+                gyArr[k] = gy;
+                wArr[k] = weight;
+                ++k;
+
+                Ixx += weight * gx * gx;
+                Ixy += weight * gx * gy;
+                Iyy += weight * gy * gy;
+            }
+        }
+
+        float reg = 0.0025f;
+        float a00 = Ixx + reg;
+        float a11 = Iyy + reg;
+        float det = a00 * a11 - Ixy * Ixy;
+
+        if (det > 1e-7f) {
+            float invDet = 1.0f / det;
+            for (int iter = 0; iter < lkIterations; ++iter) {
+                float bx = 0.0f, by = 0.0f;
+                int kk = 0;
+                for (int dy = -2; dy <= 2; ++dy) {
+                    int ay = clampi(y + dy, 0, h - 1);
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        int ax = clampi(x + dx, 0, w - 1);
+                        float valB = sampleFloat1_Bilinear(lumaB, w, h, (float)ax + vx, (float)ay + vy);
+                        float It = valB - valA[kk];
+                        float wTot = wArr[kk] * (0.08f / fmaxf(0.08f, fabsf(It)));
+                        bx -= wTot * gxArr[kk] * It;
+                        by -= wTot * gyArr[kk] * It;
+                        ++kk;
+                    }
+                }
+                float dvx = invDet * (a11 * bx - Ixy * by);
+                float dvy = invDet * (a00 * by - Ixy * bx);
+                float stepLen = hypotf(dvx, dvy);
+                if (stepLen > 1.25f) {
+                    dvx *= 1.25f / stepLen;
+                    dvy *= 1.25f / stepLen;
+                }
+                float candVx = vx + dvx;
+                float candVy = vy + dvy;
+                float candCost = evalPatchCostShared(
+                    x, y, w, h, baseX, baseY, mBaseX, mBaseY,
+                    sLumaA, sMatteA, lumaB, fgCenter, activeMatte, candVx, candVy, bestCost);
+                if (candCost <= bestCost) {
+                    vx = candVx;
+                    vy = candVy;
+                    bestCost = candCost;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    outFlow[y * w + x] = make_float2(vx, vy);
+}
+
+// Neural / All-Pairs Correlation Cost Volume Update at Proxy Resolution
+__global__ void correlationFlowKernel(
+    int w, int h,
+    const float* lumaA, const float* matteA,
+    const float* lumaB,
+    const float2* inFlow, float2* outFlow, float* outGradXY)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    int xm = max(0, x - 1), xp = min(w - 1, x + 1);
+    int ym = max(0, y - 1), yp = min(h - 1, y + 1);
+
+    // Preload 3x3 patch in A into registers once
+    float aPatch[9];
+    aPatch[0] = __ldg(&lumaA[ym * w + xm]); aPatch[1] = __ldg(&lumaA[ym * w + x]); aPatch[2] = __ldg(&lumaA[ym * w + xp]);
+    aPatch[3] = __ldg(&lumaA[y  * w + xm]); aPatch[4] = __ldg(&lumaA[y  * w + x]); aPatch[5] = __ldg(&lumaA[y  * w + xp]);
+    aPatch[6] = __ldg(&lumaA[yp * w + xm]); aPatch[7] = __ldg(&lumaA[yp * w + x]); aPatch[8] = __ldg(&lumaA[yp * w + xp]);
+
+    if (outGradXY) {
+        outGradXY[idx * 2 + 0] = 0.5f * (aPatch[5] - aPatch[3]);
+        outGradXY[idx * 2 + 1] = 0.5f * (aPatch[7] - aPatch[1]);
+    }
+
+    float2 cur = __ldg(&inFlow[idx]);
+    float bestScore = 1e9f;
+    float2 bestDelta = cur;
+
+    const int axList[3] = {xm, x, xp};
+    const int ayList[3] = {ym, y, yp};
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            float sx = cur.x + (float)dx * 0.5f;
+            float sy = cur.y + (float)dy * 0.5f;
+            float err = 0.0f;
+            for (int py = 0; py < 3; ++py) {
+                float by = (float)ayList[py] + sy;
+                int base = py * 3;
+                for (int px = 0; px < 3; ++px) {
+                    float b = sampleFloat1_Bilinear(lumaB, w, h, (float)axList[px] + sx, by);
+                    err += fabsf(aPatch[base + px] - b);
+                }
+                if (err >= bestScore) break;
+            }
+            if (err < bestScore) {
+                bestScore = err;
+                bestDelta = make_float2(sx, sy);
+            }
+        }
+    }
+
+    outFlow[idx] = bestDelta;
+}
+
+// GPU-native 3x3 Laplacian residual flow refinement (exact match to embedded ONNX graph)
+__global__ void embeddedResidualRefineKernel(
+    int w, int h, const float2* inFlow, float2* outFlow)
+{
+    __shared__ float2 sFlow[18][18];
+    const int baseX = (int)blockIdx.x * 16 - 1;
+    const int baseY = (int)blockIdx.y * 16 - 1;
+    const int tid = (int)threadIdx.y * 16 + (int)threadIdx.x;
+
+    for (int k = tid; k < 18 * 18; k += 256) {
+        int sy = k / 18;
+        int sx = k - sy * 18;
+        int gx = clampi(baseX + sx, 0, w - 1);
+        int gy = clampi(baseY + sy, 0, h - 1);
+        sFlow[sy][sx] = __ldg(&inFlow[gy * w + gx]);
+    }
+    __syncthreads();
+
+    int x = (int)blockIdx.x * 16 + (int)threadIdx.x;
+    int y = (int)blockIdx.y * 16 + (int)threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int stx = (int)threadIdx.x + 1;
+    int sty = (int)threadIdx.y + 1;
+    float2 c = sFlow[sty][stx];
+
+    float2 tl = sFlow[sty - 1][stx - 1], tc = sFlow[sty - 1][stx], tr = sFlow[sty - 1][stx + 1];
+    float2 ml = sFlow[sty    ][stx - 1],                            mr = sFlow[sty    ][stx + 1];
+    float2 bl = sFlow[sty + 1][stx - 1], bc = sFlow[sty + 1][stx], br = sFlow[sty + 1][stx + 1];
+
+    float lapX = 0.0625f * (tl.x + tr.x + bl.x + br.x) + 0.125f * (tc.x + ml.x + mr.x + bc.x) - 0.75f * c.x;
+    float lapY = 0.0625f * (tl.y + tr.y + bl.y + br.y) + 0.125f * (tc.y + ml.y + mr.y + bc.y) - 0.75f * c.y;
+
+    outFlow[y * w + x] = make_float2(c.x + 0.08f * lapX, c.y + 0.08f * lapY);
+}
+
+__global__ void jointBilateralFlowFilterKernel(
+    int w, int h,
+    const float2* inFlow, const float* guideLuma, const float* guideMatte,
+    float sigmaRange, int hasMatte,
+    float2* outFlow)
+{
+    __shared__ float2 sFlow[20][20];
+    __shared__ float sLuma[20][20];
+    __shared__ float sMatte[20][20];
+
+    const int bx0 = (int)blockIdx.x * 16;
+    const int by0 = (int)blockIdx.y * 16;
+    const int baseX = bx0 - 2;
+    const int baseY = by0 - 2;
+    const int tid = (int)threadIdx.y * 16 + (int)threadIdx.x;
+    const int activeMatte = (hasMatte && guideMatte) ? 1 : 0;
+
+    for (int k = tid; k < 20 * 20; k += 256) {
+        int sy = k / 20;
+        int sx = k - sy * 20;
+        int gx = clampi(baseX + sx, 0, w - 1);
+        int gy = clampi(baseY + sy, 0, h - 1);
+        int gidx = gy * w + gx;
+        sFlow[sy][sx] = __ldg(&inFlow[gidx]);
+        sLuma[sy][sx] = __ldg(&guideLuma[gidx]);
+        if (activeMatte) {
+            sMatte[sy][sx] = __ldg(&guideMatte[gidx]);
+        }
+    }
+    __syncthreads();
+
+    int x = bx0 + (int)threadIdx.x;
+    int y = by0 + (int)threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int stx = (int)threadIdx.x + 2;
+    int sty = (int)threadIdx.y + 2;
+    float lc = sLuma[sty][stx];
+    int fgC = activeMatte ? ((sMatte[sty][stx] >= 0.5f) ? 1 : 0) : 1;
+
+    float inv2SigS2 = 1.0f / (2.0f * 2.0f * 2.0f);
+    float inv2SigR2 = 1.0f / (2.0f * fmaxf(0.01f, sigmaRange) * fmaxf(0.01f, sigmaRange));
+
+    float2 sumF = make_float2(0.0f, 0.0f);
+    float sumW = 0.0f;
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        int ny = clampi(y + dy, 0, h - 1) - baseY;
+        for (int dx = -2; dx <= 2; ++dx) {
+            int nx = clampi(x + dx, 0, w - 1) - baseX;
+            float ln = sLuma[ny][nx];
+            float dl = lc - ln;
+            float weight = expf(-(float)(dx * dx + dy * dy) * inv2SigS2 - dl * dl * inv2SigR2);
+            if (activeMatte) {
+                int fgN = (sMatte[ny][nx] >= 0.5f) ? 1 : 0;
+                if (fgN != fgC) weight *= 0.001f;
+            }
+            float2 nf = sFlow[ny][nx];
+            sumF.x += weight * nf.x;
+            sumF.y += weight * nf.y;
+            sumW += weight;
+        }
+    }
+
+    outFlow[y * w + x] = make_float2(sumF.x / fmaxf(1e-6f, sumW), sumF.y / fmaxf(1e-6f, sumW));
+}
+
+__global__ void jointBilateralUpsampleKernel(
+    int lowW, int lowH, int highW, int highH,
+    const float2* lowFlow, const float* lowLuma,
+    const float* highLuma, const float* highMatte,
+    float sigmaRange, int hasMatte,
+    float2* highFlow)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= highW || y >= highH) return;
+
+    int idx = y * highW + x;
+    float lh = __ldg(&highLuma[idx]);
+    float mh = highMatte ? __ldg(&highMatte[idx]) : 1.0f;
+
+    float scaleX = (float)highW / (float)lowW;
+    float scaleY = (float)highH / (float)lowH;
+    float lx = ((float)x + 0.5f) / scaleX - 0.5f;
+    float ly = ((float)y + 0.5f) / scaleY - 0.5f;
+
+    int lx0 = (int)floorf(lx);
+    int ly0 = (int)floorf(ly);
+    float inv2SigR2 = 1.0f / (2.0f * fmaxf(0.015f, sigmaRange) * fmaxf(0.015f, sigmaRange));
+
+    float2 sumF = make_float2(0.0f, 0.0f);
+    float sumW = 0.0f;
+
+    for (int dy = -1; dy <= 2; ++dy) {
+        int sy = clampi(ly0 + dy, 0, lowH - 1);
+        for (int dx = -1; dx <= 2; ++dx) {
+            int sx = clampi(lx0 + dx, 0, lowW - 1);
+            float dist2 = ((float)sx - lx) * ((float)sx - lx) + ((float)sy - ly) * ((float)sy - ly);
+            float ll = __ldg(&lowLuma[sy * lowW + sx]);
+            float dl = lh - ll;
+            float w = expf(-dist2 * 0.5f - dl * dl * inv2SigR2);
+            if (hasMatte && highMatte) {
+                int hx = clampi((int)(((float)sx + 0.5f) * scaleX), 0, highW - 1);
+                int hy = clampi((int)(((float)sy + 0.5f) * scaleY), 0, highH - 1);
+                float dm = mh - __ldg(&highMatte[hy * highW + hx]);
+                w *= expf(-dm * dm * 40.0f);
+            }
+            float2 lf = __ldg(&lowFlow[sy * lowW + sx]);
+            sumF.x += w * lf.x * scaleX;
+            sumF.y += w * lf.y * scaleY;
+            sumW += w;
+        }
+    }
+
+    highFlow[idx] = make_float2(sumF.x / fmaxf(1e-6f, sumW), sumF.y / fmaxf(1e-6f, sumW));
+}
+
+__global__ void packBidirectionalKernel(
+    int w, int h,
+    const float2* fwdFlow, const float2* bwdFlow,
+    float4* outFlow4, float2* outConf2)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    float2 f = __ldg(&fwdFlow[idx]);
+    float2 bLocal = __ldg(&bwdFlow[idx]);
+    float2 bAtDest = sampleFloat2_Bilinear(bwdFlow, w, h, (float)x + f.x, (float)y + f.y);
+    float2 fAtDest = sampleFloat2_Bilinear(fwdFlow, w, h, (float)x + bLocal.x, (float)y + bLocal.y);
+
+    float errFX = f.x + bAtDest.x;
+    float errFY = f.y + bAtDest.y;
+    float confFwd = expf(-(errFX * errFX + errFY * errFY) * 0.25f);
+
+    float errBX = bLocal.x + fAtDest.x;
+    float errBY = bLocal.y + fAtDest.y;
+    float confBwd = expf(-(errBX * errBX + errBY * errBY) * 0.25f);
+
+    outFlow4[idx] = make_float4(f.x, f.y, bLocal.x, bLocal.y);
+    outConf2[idx] = make_float2(confFwd, confBwd);
+}
+
+// Coalesced 16x16 block-per-tile shared-memory parallel reduction
+__global__ void tileMaxVelKernel(
+    int w, int h, int tileW, int tileH, int tileSize,
+    const float4* flowFwd, int fwdRev,
+    const float4* flowBwd, int bwdRev,
+    float sensitivity, float threshold,
+    float2* tileMax)
+{
+    __shared__ float sMag[256];
+    __shared__ float2 sVel[256];
+
+    int tx = blockIdx.x;
+    int ty = blockIdx.y;
+    int x = tx * tileSize + threadIdx.x;
+    int y = ty * tileSize + threadIdx.y;
+    int tid = threadIdx.y * 16 + threadIdx.x;
+
+    float mag = 0.0f;
+    float2 vel = make_float2(0.0f, 0.0f);
+    if (x < w && y < h) {
+        int idx = y * w + x;
+        float2 vf = flowFwd ? readFlowVec(flowFwd, idx, fwdRev) : make_float2(0.0f, 0.0f);
+        float2 vb = flowBwd ? readFlowVec(flowBwd, idx, bwdRev) : make_float2(0.0f, 0.0f);
+        if (!flowFwd && flowBwd) { vf = make_float2(-vb.x, -vb.y); }
+        if (!flowBwd && flowFwd) { vb = make_float2(-vf.x, -vf.y); }
+        float2 v0 = make_float2(0.5f * (vf.x - vb.x) * sensitivity, 0.5f * (vf.y - vb.y) * sensitivity);
+        float m = hypotf(v0.x, v0.y);
+        if (m > threshold) {
+            float gate = smoothstepf(threshold, threshold + 0.75f, m);
+            mag = m * gate;
+            vel = make_float2(v0.x * gate, v0.y * gate);
+        }
+    }
+
+    sMag[tid] = mag;
+    sVel[tid] = vel;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride && sMag[tid + stride] > sMag[tid]) {
+            sMag[tid] = sMag[tid + stride];
+            sVel[tid] = sVel[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && tx < tileW && ty < tileH) {
+        tileMax[ty * tileW + tx] = sVel[0];
+    }
+}
+
+__global__ void neighborMaxVelKernel(
+    int tileW, int tileH, const float2* tileMax, float2* neighborMax)
+{
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    if (tx >= tileW || ty >= tileH) return;
+
+    float bestMag = 0.0f;
+    float2 bestVel = make_float2(0.0f, 0.0f);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = clampi(ty + dy, 0, tileH - 1);
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = clampi(tx + dx, 0, tileW - 1);
+            float2 v = tileMax[ny * tileW + nx];
+            float m = hypotf(v.x, v.y);
+            if (m > bestMag) {
+                bestMag = m;
+                bestVel = v;
+            }
+        }
+    }
+
+    neighborMax[ty * tileW + tx] = bestVel;
+}
+
+__global__ void synthesizeShutterBlurKernel(
+    int w, int h, int tileW, int tileH, int tileSize,
+    const float* srcRGBA,
+    const float4* flowFwd, int fwdRev, // (t->t+1)
+    const float4* flowBwd, int bwdRev, // (t->t-1)
+    const float2* conf2,
+    const float2* neighborMax,
+    const float* matteTex,
+    int hasMatte, int matteMode,
+    float shutterAngle, float shutterPhase, int samples,
+    float sensitivity, float threshold,
+    float highlightBoost,
+    float* dstRGBA)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* src4 = (const float4*)srcRGBA;
+    float4* dst4 = (float4*)dstRGBA;
+    float4 centerP = __ldg(&src4[idx]);
+    float mCenter = (hasMatte && matteTex) ? __ldg(&matteTex[idx]) : 1.0f;
+
+    if (matteMode == 2 && hasMatte && mCenter <= 0.001f) {
+        dst4[idx] = centerP;
+        return;
+    }
+
+    float2 vf = flowFwd ? readFlowVec(flowFwd, idx, fwdRev) : make_float2(0.0f, 0.0f);
+    float2 vb = flowBwd ? readFlowVec(flowBwd, idx, bwdRev) : make_float2(0.0f, 0.0f);
+    if (!flowFwd && flowBwd) { vf = make_float2(-vb.x, -vb.y); }
+    if (!flowBwd && flowFwd) { vb = make_float2(-vf.x, -vf.y); }
+
+    vf.x *= sensitivity; vf.y *= sensitivity;
+    vb.x *= sensitivity; vb.y *= sensitivity;
+
+    float2 v0 = make_float2(0.5f * (vf.x - vb.x), 0.5f * (vf.y - vb.y));
+    float2 a0 = make_float2(vf.x + vb.x, vf.y + vb.y);
+
+    float centerSpeed = hypotf(v0.x, v0.y);
+    float centerGate = smoothstepf(threshold, threshold + 0.75f, centerSpeed);
+    v0.x *= centerGate; v0.y *= centerGate;
+    a0.x *= centerGate; a0.y *= centerGate;
+    centerSpeed *= centerGate;
+
+    int tx = min(tileW - 1, x / tileSize);
+    int ty = min(tileH - 1, y / tileSize);
+    float2 vDom = __ldg(&neighborMax[ty * tileW + tx]);
+    float domSpeed = hypotf(vDom.x, vDom.y);
+
+    float shutterSpan = shutterAngle / 360.0f;
+    float halfSpan = 0.5f * shutterSpan;
+    float phaseCenter = shutterPhase / 360.0f;
+
+    if (fmaxf(centerSpeed, domSpeed) * shutterSpan < 0.25f) {
+        dst4[idx] = centerP;
+        return;
+    }
+
+    // Interleaved hash jitter for banding-free temporal integration
+    float jRaw = (float)(((x * 73856093) ^ (y * 19349663)) & 0xFFFF) * (1.0f / 65536.0f);
+    float jitter = jRaw - 0.5f;
+
+    float3 accumRGB = make_float3(0.0f, 0.0f, 0.0f);
+    float accumA = 0.0f;
+    float accumAlphaW = 0.0f;
+    float accumW = 0.0f;
+
+    float fgCenter = (hasMatte && matteMode == 1) ? mCenter : (centerSpeed > 0.35f * domSpeed ? 1.0f : 0.0f);
+    const bool useDom = (domSpeed > centerSpeed + 0.75f) && (fgCenter < 0.5f);
+    const bool matteIso = (hasMatte && matteMode == 1);
+    const float invSamples = 1.0f / (float)samples;
+    const float jOffset = 0.5f + 0.35f * jitter;
+
+    for (int i = 0; i < samples; ++i) {
+        float u = ((float)i + jOffset) * invSamples;
+        float tau = phaseCenter + (u - 0.5f) * shutterSpan;
+
+        float2 disp;
+        if (useDom) {
+            disp = make_float2(vDom.x * tau, vDom.y * tau);
+        } else {
+            float halfTau2 = 0.5f * tau * tau;
+            disp = make_float2(v0.x * tau + a0.x * halfTau2,
+                               v0.y * tau + a0.y * halfTau2);
+        }
+
+        float sx = (float)x + disp.x;
+        float sy = (float)y + disp.y;
+
+        int isx = clampi((int)roundf(sx), 0, w - 1);
+        int isy = clampi((int)roundf(sy), 0, h - 1);
+        int sIdx = isy * w + isx;
+
+        float wSample = 1.0f;
+
+        if (matteIso) {
+            float sMatte = matteTex ? __ldg(&matteTex[sIdx]) : 1.0f;
+            if (mCenter >= 0.5f) {
+                if (sMatte < 0.5f) {
+                    wSample = 0.0f;
+                }
+            } else if (sMatte >= 0.5f) {
+                float2 svf = flowFwd ? readFlowVec(flowFwd, sIdx, fwdRev) : make_float2(0.0f, 0.0f);
+                float2 svb = flowBwd ? readFlowVec(flowBwd, sIdx, bwdRev) : make_float2(0.0f, 0.0f);
+                if (!flowFwd && flowBwd) { svf = make_float2(-svb.x, -svb.y); }
+                if (!flowBwd && flowFwd) { svb = make_float2(-svf.x, -svf.y); }
+                float sSpeed = hypotf(0.5f * (svf.x - svb.x) * sensitivity, 0.5f * (svf.y - svb.y) * sensitivity);
+                float distToSample = hypotf(disp.x, disp.y);
+                float reach = sSpeed * halfSpan + 1.0f;
+                wSample = (distToSample <= reach) ? 1.0f : 0.0f;
+            }
+        } else if (centerSpeed > 1.5f || useDom) {
+            float2 svf = flowFwd ? readFlowVec(flowFwd, sIdx, fwdRev) : make_float2(0.0f, 0.0f);
+            float2 svb = flowBwd ? readFlowVec(flowBwd, sIdx, bwdRev) : make_float2(0.0f, 0.0f);
+            if (!flowFwd && flowBwd) { svf = make_float2(-svb.x, -svb.y); }
+            if (!flowBwd && flowFwd) { svb = make_float2(-svf.x, -svf.y); }
+            float sSpeed = hypotf(0.5f * (svf.x - svb.x) * sensitivity, 0.5f * (svf.y - svb.y) * sensitivity);
+            if (centerSpeed > 1.5f && sSpeed < 0.35f * centerSpeed) {
+                wSample = 0.05f;
+            } else if (useDom) {
+                float distToSample = hypotf(disp.x, disp.y);
+                float reach = sSpeed * halfSpan + 1.0f;
+                wSample = (sSpeed > 0.4f * domSpeed && distToSample <= reach) ? 1.0f : 0.0f;
+            }
+        }
+
+        if (wSample <= 0.0f) continue;
+
+        float4 pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+        pix.x = dwiToLinearChannel(pix.x);
+        pix.y = dwiToLinearChannel(pix.y);
+        pix.z = dwiToLinearChannel(pix.z);
+
+        float luma = dwgLuminance(pix.x, pix.y, pix.z);
+        float hdrW = 1.0f + highlightBoost * powf(fmaxf(0.0f, luma - 0.8f), 1.5f);
+        float totW = wSample * hdrW;
+
+        accumRGB.x += totW * pix.x;
+        accumRGB.y += totW * pix.y;
+        accumRGB.z += totW * pix.z;
+        accumA += wSample * pix.w;
+        accumAlphaW += wSample;
+        accumW += totW;
+    }
+
+    if (accumW < 1e-6f) {
+        dst4[idx] = centerP;
+        return;
+    }
+
+    float3 outRGB = make_float3(accumRGB.x / accumW, accumRGB.y / accumW, accumRGB.z / accumW);
+    float outA = clampf(accumA / fmaxf(1e-6f, accumAlphaW), 0.0f, 1.0f);
+
+    outRGB.x = linearToDwiChannel(outRGB.x);
+    outRGB.y = linearToDwiChannel(outRGB.y);
+    outRGB.z = linearToDwiChannel(outRGB.z);
+
+    if (matteMode == 2 && hasMatte) {
+        outRGB.x = centerP.x * (1.0f - mCenter) + outRGB.x * mCenter;
+        outRGB.y = centerP.y * (1.0f - mCenter) + outRGB.y * mCenter;
+        outRGB.z = centerP.z * (1.0f - mCenter) + outRGB.z * mCenter;
+    }
+
+    dst4[idx] = make_float4(outRGB.x, outRGB.y, outRGB.z, outA);
+}
+
+__global__ void zeroFloatBufferKernel(int count, float* buf) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) buf[idx] = 0.0f;
+}
+
+__global__ void trailBaseInitKernel(
+    int w, int h, const float* currRGBA, int blendMode, float* accumRGBW)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* cur4 = (const float4*)currRGBA;
+    float4* acc4 = (float4*)accumRGBW;
+    float4 p = __ldg(&cur4[idx]);
+    float r = dwiToLinearChannel(p.x);
+    float g = dwiToLinearChannel(p.y);
+    float b = dwiToLinearChannel(p.z);
+
+    if (blendMode == 1) {
+        acc4[idx] = make_float4(r, g, b, 1.0f);
+    } else {
+        acc4[idx] = make_float4(r * 0.02f, g * 0.02f, b * 0.02f, 0.02f);
+    }
+}
+
+__global__ void trailSplatSubFrameKernel(
+    int w, int h,
+    const float* frameA, const float* frameB,
+    const float4* flow4, const float2* conf2, int flowRev,
+    const float* matteA, int hasMatte, int matteMode,
+    int pairAgeIndex, int subFrameSteps, int hasFrameB,
+    int blendMode, float trailDecay,
+    float sensitivity, float motionThreshold, float lumaThreshold,
+    float highlightBoost,
+    float* accumRGBW)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* frameA4 = (const float4*)frameA;
+    float4 pA = __ldg(&frameA4[idx]);
+    float rA = dwiToLinearChannel(pA.x);
+    float gA = dwiToLinearChannel(pA.y);
+    float bA = dwiToLinearChannel(pA.z);
+
+    float2 fl = flow4 ? readFlowVec(flow4, idx, flowRev) : make_float2(0.0f, 0.0f);
+    float vx = fl.x * sensitivity;
+    float vy = fl.y * sensitivity;
+    float speed = hypotf(vx, vy);
+
+    float mVal = (hasMatte && matteA) ? __ldg(&matteA[idx]) : 1.0f;
+    if (hasMatte && matteMode == 2 && mVal <= 0.001f) {
+        if (blendMode != 1) {
+            float decayLambda = 0.2f + 2.8f * trailDecay;
+            float wBase = (blendMode == 2) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+            atomicAdd(&accumRGBW[idx * 4 + 0], rA * wBase);
+            atomicAdd(&accumRGBW[idx * 4 + 1], gA * wBase);
+            atomicAdd(&accumRGBW[idx * 4 + 2], bA * wBase);
+            atomicAdd(&accumRGBW[idx * 4 + 3], wBase);
+        }
+        return;
+    }
+
+    float luma = dwgLuminance(rA, gA, bA);
+    float lumaDwi = linearToDwiChannel(luma);
+    float motionGate = (motionThreshold > 0.0f) ? smoothstepf(motionThreshold, motionThreshold + 0.75f, speed) : 1.0f;
+    float lumaGate = (lumaThreshold > 0.0f) ? smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi) : 1.0f;
+
+    // Early reject gated-out pixels in Light-Painting mode before sampling frameB or splatting
+    if (blendMode == 1 && motionGate * lumaGate <= 0.01f) {
+        return;
+    }
+
+    float decayLambda = 0.25f + 3.2f * trailDecay;
+    float hdrW = 1.0f + highlightBoost * powf(fmaxf(0.0f, luma - 0.8f), 1.5f);
+
+    if (subFrameSteps <= 1 || !hasFrameB || speed < 0.35f) {
+        float age = (float)pairAgeIndex;
+        float timeW = (blendMode == 2) ? expf(-decayLambda * age) : 1.0f;
+        if (blendMode == 1) {
+            float gate = motionGate * lumaGate * timeW;
+            if (gate > 0.01f) {
+                atomicMaxFloat(&accumRGBW[idx * 4 + 0], rA * gate);
+                atomicMaxFloat(&accumRGBW[idx * 4 + 1], gA * gate);
+                atomicMaxFloat(&accumRGBW[idx * 4 + 2], bA * gate);
+            }
+        } else {
+            float wTot = timeW * hdrW;
+            atomicAdd(&accumRGBW[idx * 4 + 0], rA * wTot);
+            atomicAdd(&accumRGBW[idx * 4 + 1], gA * wTot);
+            atomicAdd(&accumRGBW[idx * 4 + 2], bA * wTot);
+            atomicAdd(&accumRGBW[idx * 4 + 3], wTot);
+        }
+        return;
+    }
+
+    int adaptiveSteps = max(subFrameSteps, min(72, (int)ceilf(speed * 1.25f)));
+    float invSteps = 1.0f / (float)adaptiveSteps;
+
+    float4 pB = sampleRGBA_Bilinear(frameB, w, h, (float)x + fl.x, (float)y + fl.y);
+    pB.x = dwiToLinearChannel(pB.x);
+    pB.y = dwiToLinearChannel(pB.y);
+    pB.z = dwiToLinearChannel(pB.z);
+    float conf = conf2 ? readConfVal(conf2, idx, flowRev) : 1.0f;
+
+    for (int s = 0; s < adaptiveSteps; ++s) {
+        float alpha = (float)s * invSteps;
+        float px = (float)x + alpha * vx;
+        float py = (float)y + alpha * vy;
+
+        float blendB = alpha * conf;
+        float sr = rA * (1.0f - blendB) + pB.x * blendB;
+        float sg = gA * (1.0f - blendB) + pB.y * blendB;
+        float sb = bA * (1.0f - blendB) + pB.z * blendB;
+
+        float age = (float)pairAgeIndex + alpha;
+        float timeW = (blendMode == 2) ? expf(-decayLambda * age) : 1.0f;
+
+        int x0 = (int)floorf(px);
+        int y0 = (int)floorf(py);
+        float fx = px - (float)x0;
+        float fy = py - (float)y0;
+
+        float bw[4] = {
+            (1.0f - fx) * (1.0f - fy),
+            fx * (1.0f - fy),
+            (1.0f - fx) * fy,
+            fx * fy
+        };
+        int ox[4] = {x0, x0 + 1, x0, x0 + 1};
+        int oy[4] = {y0, y0, y0 + 1, y0 + 1};
+
+        if (blendMode == 1) {
+            float gate = motionGate * lumaGate * timeW;
+            if (gate <= 0.01f) continue;
+            for (int c = 0; c < 4; ++c) {
+                if (ox[c] >= 0 && ox[c] < w && oy[c] >= 0 && oy[c] < h && bw[c] > 0.01f) {
+                    int tidx = oy[c] * w + ox[c];
+                    float splatGain = fminf(1.0f, bw[c] * 1.35f) * gate;
+                    atomicMaxFloat(&accumRGBW[tidx * 4 + 0], sr * splatGain);
+                    atomicMaxFloat(&accumRGBW[tidx * 4 + 1], sg * splatGain);
+                    atomicMaxFloat(&accumRGBW[tidx * 4 + 2], sb * splatGain);
+                }
+            }
+        } else {
+            float wStep = timeW * hdrW * invSteps;
+            for (int c = 0; c < 4; ++c) {
+                if (bw[c] > 1e-4f && ox[c] >= 0 && ox[c] < w && oy[c] >= 0 && oy[c] < h) {
+                    int tidx = oy[c] * w + ox[c];
+                    float wt = wStep * bw[c];
+                    atomicAdd(&accumRGBW[tidx * 4 + 0], sr * wt);
+                    atomicAdd(&accumRGBW[tidx * 4 + 1], sg * wt);
+                    atomicAdd(&accumRGBW[tidx * 4 + 2], sb * wt);
+                    atomicAdd(&accumRGBW[tidx * 4 + 3], wt);
+                }
+            }
+        }
+    }
+}
+
+__global__ void trailFinalizeKernel(
+    int w, int h,
+    const float* currRGBA, const float* accumRGBW, const float* matteTex,
+    int hasMatte, int matteMode,
+    int blendMode, float rearCurtainCrispness,
+    float* dstRGBA)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* cur4 = (const float4*)currRGBA;
+    const float4* acc4 = (const float4*)accumRGBW;
+    float4* dst4 = (float4*)dstRGBA;
+
+    float4 cur = __ldg(&cur4[idx]);
+    float4 acc = acc4[idx];
+
+    float cr = dwiToLinearChannel(cur.x);
+    float cg = dwiToLinearChannel(cur.y);
+    float cb = dwiToLinearChannel(cur.z);
+
+    float or_, og_, ob_;
+    if (blendMode == 1) {
+        or_ = fmaxf(cr, acc.x);
+        og_ = fmaxf(cg, acc.y);
+        ob_ = fmaxf(cb, acc.z);
+    } else {
+        float wSum = fmaxf(1e-5f, acc.w);
+        or_ = acc.x / wSum;
+        og_ = acc.y / wSum;
+        ob_ = acc.z / wSum;
+
+        if (blendMode == 2 && rearCurtainCrispness > 0.0f) {
+            float crisp = clampf(rearCurtainCrispness, 0.0f, 1.0f);
+            or_ = or_ * (1.0f - crisp) + cr * crisp;
+            og_ = og_ * (1.0f - crisp) + cg * crisp;
+            ob_ = ob_ * (1.0f - crisp) + cb * crisp;
+        }
+    }
+
+    or_ = linearToDwiChannel(or_);
+    og_ = linearToDwiChannel(og_);
+    ob_ = linearToDwiChannel(ob_);
+
+    if (hasMatte && matteMode == 2 && matteTex) {
+        float m = __ldg(&matteTex[idx]);
+        or_ = cur.x * (1.0f - m) + or_ * m;
+        og_ = cur.y * (1.0f - m) + og_ * m;
+        ob_ = cur.z * (1.0f - m) + ob_ * m;
+    }
+
+    dst4[idx] = make_float4(or_, og_, ob_, cur.w);
+}
+
+__global__ void applySeqFeedbackKernel(
+    int w, int h, float decay, int blendMode,
+    const float* prevAccum, float* currOut)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    float4* dst4 = (float4*)currOut;
+    const float4* prev4 = (const float4*)prevAccum;
+    float4 dstV = dst4[idx];
+    float4 prevV = __ldg(&prev4[idx]);
+
+    float k = clampf(1.0f - decay * 0.5f, 0.1f, 0.96f);
+    float dr = dwiToLinearChannel(dstV.x);
+    float dg = dwiToLinearChannel(dstV.y);
+    float db = dwiToLinearChannel(dstV.z);
+    float pr = dwiToLinearChannel(prevV.x);
+    float pg = dwiToLinearChannel(prevV.y);
+    float pb = dwiToLinearChannel(prevV.z);
+
+    if (blendMode == 1) {
+        dr = fmaxf(dr, pr * k);
+        dg = fmaxf(dg, pg * k);
+        db = fmaxf(db, pb * k);
+    } else {
+        float alpha = 1.0f - k * 0.65f;
+        dr = pr * (1.0f - alpha) + dr * alpha;
+        dg = pg * (1.0f - alpha) + dg * alpha;
+        db = pb * (1.0f - alpha) + db * alpha;
+    }
+    dst4[idx] = make_float4(linearToDwiChannel(dr), linearToDwiChannel(dg), linearToDwiChannel(db), dstV.w);
+}
+
+__device__ __forceinline__ void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
+    float c = v * s;
+    float hp = fmodf(h * 6.0f, 6.0f);
+    float x = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+    float m = v - c;
+    if (hp < 1.0f)      { r = c; g = x; b = 0; }
+    else if (hp < 2.0f) { r = x; g = c; b = 0; }
+    else if (hp < 3.0f) { r = 0; g = c; b = x; }
+    else if (hp < 4.0f) { r = 0; g = x; b = c; }
+    else if (hp < 5.0f) { r = x; g = 0; b = c; }
+    else                { r = c; g = 0; b = x; }
+    r += m; g += m; b += m;
+}
+
+__global__ void renderDiagnosticViewKernel(
+    int w, int h, int viewMode,
+    const float* srcRGBA, const float4* flow4, const float2* conf2, int flowRev,
+    const float* matteTex, int hasMatte,
+    float sensitivity, float motionThresh, float lumaThresh,
+    float* dstRGBA)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    int idx = y * w + x;
+    const float4* src4 = (const float4*)srcRGBA;
+    float4* dst4 = (float4*)dstRGBA;
+    float4 p = __ldg(&src4[idx]);
+    float2 f = flow4 ? readFlowVec(flow4, idx, flowRev) : make_float2(0.0f, 0.0f);
+    float conf = conf2 ? clampf(readConfVal(conf2, idx, flowRev), 0.0f, 1.0f) : 1.0f;
+
+    float vx = f.x * sensitivity;
+    float vy = f.y * sensitivity;
+    float mag = hypotf(vx, vy);
+
+    if (viewMode == 1) {
+        float angle = atan2f(vy, vx);
+        float hue = (angle + 3.14159265f) / (2.0f * 3.14159265f);
+        float val = clampf(mag / 24.0f, 0.0f, 1.0f);
+        float r, g, b;
+        hsvToRgb(hue, 0.95f, val, r, g, b);
+        dst4[idx] = make_float4(r, g, b, p.w);
+    } else if (viewMode == 2) {
+        dst4[idx] = make_float4(1.0f - conf, conf, 0.15f, p.w);
+    } else {
+        float luma = dwgLuminance(p.x, p.y, p.z);
+        float mg = (motionThresh > 0.0f) ? smoothstepf(motionThresh, motionThresh + 0.75f, mag) : 1.0f;
+        float lg = (lumaThresh > 0.0f) ? smoothstepf(lumaThresh, lumaThresh + 0.12f, luma) : 1.0f;
+        float fg = (hasMatte && matteTex) ? __ldg(&matteTex[idx]) : 1.0f;
+        float mask = mg * lg * fg;
+        dst4[idx] = make_float4(mask, mask, mask, p.w);
+    }
+}
+
+} // extern "C"
+)CUDA";
+
+template <typename Fn>
+bool loadSym(HMODULE mod, Fn& dst, const char* name) {
+    dst = reinterpret_cast<Fn>(GetProcAddress(mod, name));
+    return dst != nullptr;
+}
+
+bool isProcessShuttingDown() {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return false;
+    using FnRtlShutdown = BOOLEAN(NTAPI*)();
+    auto fn = reinterpret_cast<FnRtlShutdown>(GetProcAddress(ntdll, "RtlDllShutdownInProgress"));
+    return fn && fn() != 0;
+}
+
+} // namespace
+
+CudaEngine& CudaEngine::instance() {
+    static CudaEngine inst;
+    return inst;
+}
+
+CudaEngine::~CudaEngine() {
+    shutdown();
+    m_alive.store(false, std::memory_order_release);
+}
+
+bool CudaEngine::initialize() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_initialized) return true;
+    if (m_attemptedInit && !m_initialized) return false;
+    m_attemptedInit = true;
+
+    HMODULE cuMod = GetModuleHandleA("nvcuda.dll");
+    if (!cuMod) cuMod = LoadLibraryA("nvcuda.dll");
+    if (!cuMod) {
+        m_lastError = "Failed to load nvcuda.dll";
+        return false;
+    }
+    m_cudaDll = cuMod;
+
+    bool ok = true;
+    ok &= loadSym(cuMod, g_cu.cuInit, "cuInit");
+    ok &= loadSym(cuMod, g_cu.cuDeviceGet, "cuDeviceGet");
+    ok &= loadSym(cuMod, g_cu.cuDeviceGetName, "cuDeviceGetName");
+    loadSym(cuMod, g_cu.cuDeviceGetAttribute, "cuDeviceGetAttribute");
+    ok &= loadSym(cuMod, g_cu.cuCtxGetCurrent, "cuCtxGetCurrent");
+    ok &= loadSym(cuMod, g_cu.cuCtxCreate, "cuCtxCreate_v2");
+    loadSym(cuMod, g_cu.cuCtxDestroy, "cuCtxDestroy_v2");
+    ok &= loadSym(cuMod, g_cu.cuCtxSetCurrent, "cuCtxSetCurrent");
+    ok &= loadSym(cuMod, g_cu.cuModuleLoadDataEx, "cuModuleLoadDataEx");
+    ok &= loadSym(cuMod, g_cu.cuModuleUnload, "cuModuleUnload");
+    ok &= loadSym(cuMod, g_cu.cuModuleGetFunction, "cuModuleGetFunction");
+    ok &= loadSym(cuMod, g_cu.cuMemAlloc, "cuMemAlloc_v2");
+    ok &= loadSym(cuMod, g_cu.cuMemFree, "cuMemFree_v2");
+    ok &= loadSym(cuMod, g_cu.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
+    ok &= loadSym(cuMod, g_cu.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");
+    ok &= loadSym(cuMod, g_cu.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
+    ok &= loadSym(cuMod, g_cu.cuMemsetD8Async, "cuMemsetD8Async");
+    ok &= loadSym(cuMod, g_cu.cuLaunchKernel, "cuLaunchKernel");
+    ok &= loadSym(cuMod, g_cu.cuStreamSynchronize, "cuStreamSynchronize");
+    if (!ok) {
+        m_lastError = "Missing CUDA Driver API exports in nvcuda.dll";
+        return false;
+    }
+
+    if (g_cu.cuInit(0) != CUDA_SUCCESS_VAL) {
+        m_lastError = "cuInit(0) failed";
+        return false;
+    }
+
+    HMODULE nvrtcMod = GetModuleHandleA("nvrtc64_120_0.dll");
+    if (!nvrtcMod) {
+        LoadLibraryExA("C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\nvrtc-builtins64_128.dll",
+                       nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        nvrtcMod = LoadLibraryExA("C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\nvrtc64_120_0.dll",
+                                  nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    if (!nvrtcMod) nvrtcMod = LoadLibraryA("nvrtc64_120_0.dll");
+    if (!nvrtcMod) nvrtcMod = LoadLibraryA("nvrtc64_128_0.dll");
+    if (!nvrtcMod) {
+        m_lastError = "Failed to load nvrtc64_120_0.dll";
+        return false;
+    }
+    m_nvrtcDll = nvrtcMod;
+
+    ok = true;
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcCreateProgram, "nvrtcCreateProgram");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcDestroyProgram, "nvrtcDestroyProgram");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcCompileProgram, "nvrtcCompileProgram");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcGetPTXSize, "nvrtcGetPTXSize");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcGetPTX, "nvrtcGetPTX");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcGetProgramLogSize, "nvrtcGetProgramLogSize");
+    ok &= loadSym(nvrtcMod, g_cu.nvrtcGetProgramLog, "nvrtcGetProgramLog");
+    if (!ok) {
+        m_lastError = "Missing NVRTC exports";
+        return false;
+    }
+
+    if (!ensureContext()) {
+        return false;
+    }
+    if (!compileKernels()) {
+        return false;
+    }
+
+    m_initialized = true;
+    return true;
+}
+
+bool CudaEngine::ensureContext() {
+    CUdevice dev = 0;
+    if (g_cu.cuDeviceGet(&dev, 0) != CUDA_SUCCESS_VAL) {
+        m_lastError = "cuDeviceGet(0) failed";
+        return false;
+    }
+    char nameBuf[256] = {};
+    if (g_cu.cuDeviceGetName(nameBuf, sizeof(nameBuf), dev) == CUDA_SUCCESS_VAL) {
+        m_deviceName = nameBuf;
+    }
+
+    if (g_cu.cuDeviceGetAttribute) {
+        int maj = 7, min = 5;
+        if (g_cu.cuDeviceGetAttribute(&maj, 75, dev) == CUDA_SUCCESS_VAL &&
+            g_cu.cuDeviceGetAttribute(&min, 76, dev) == CUDA_SUCCESS_VAL) {
+            m_ccMajor = maj;
+            m_ccMinor = min;
+        }
+    }
+
+    CUcontext ctx = nullptr;
+    g_cu.cuCtxGetCurrent(&ctx);
+    if (!ctx) {
+        if (g_cu.cuCtxCreate(&m_ownedCtx, 0, dev) != CUDA_SUCCESS_VAL) {
+            m_lastError = "cuCtxCreate_v2 failed";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool CudaEngine::compileKernels() {
+    int sm = m_ccMajor * 10 + m_ccMinor;
+    const char* archFlag = "--gpu-architecture=compute_75";
+    if (sm >= 89)      archFlag = "--gpu-architecture=compute_89";
+    else if (sm >= 86) archFlag = "--gpu-architecture=compute_86";
+    else if (sm >= 80) archFlag = "--gpu-architecture=compute_80";
+
+    nvrtcProgram prog = nullptr;
+    if (g_cu.nvrtcCreateProgram(&prog, kEmbeddedCudaSource, "bmb_kernels.cu", 0, nullptr, nullptr) != NVRTC_SUCCESS_VAL) {
+        m_lastError = "nvrtcCreateProgram failed";
+        return false;
+    }
+
+    const char* opts[] = {archFlag, "--use_fast_math"};
+    nvrtcResult compRes = g_cu.nvrtcCompileProgram(prog, 2, opts);
+    if (compRes != NVRTC_SUCCESS_VAL && std::strcmp(archFlag, "--gpu-architecture=compute_75") != 0) {
+        g_cu.nvrtcDestroyProgram(&prog);
+        prog = nullptr;
+        if (g_cu.nvrtcCreateProgram(&prog, kEmbeddedCudaSource, "bmb_kernels.cu", 0, nullptr, nullptr) != NVRTC_SUCCESS_VAL) {
+            m_lastError = "nvrtcCreateProgram fallback failed";
+            return false;
+        }
+        const char* fallbackOpts[] = {"--gpu-architecture=compute_75", "--use_fast_math"};
+        compRes = g_cu.nvrtcCompileProgram(prog, 2, fallbackOpts);
+    }
+
+    if (compRes != NVRTC_SUCCESS_VAL) {
+        size_t logSize = 0;
+        g_cu.nvrtcGetProgramLogSize(prog, &logSize);
+        std::string log(logSize, '\0');
+        if (logSize > 1) g_cu.nvrtcGetProgramLog(prog, &log[0]);
+        m_lastError = "NVRTC compile failed: " + log;
+        g_cu.nvrtcDestroyProgram(&prog);
+        return false;
+    }
+
+    size_t ptxSize = 0;
+    g_cu.nvrtcGetPTXSize(prog, &ptxSize);
+    std::vector<char> ptx(ptxSize);
+    g_cu.nvrtcGetPTX(prog, ptx.data());
+    g_cu.nvrtcDestroyProgram(&prog);
+
+    if (g_cu.cuModuleLoadDataEx(&m_module, ptx.data(), 0, nullptr, nullptr) != CUDA_SUCCESS_VAL) {
+        m_lastError = "cuModuleLoadDataEx failed";
+        return false;
+    }
+
+    bool ok = true;
+    ok &= (g_cu.cuModuleGetFunction(&m_fnExtractLumaMatte, m_module, "extractLumaAndMatteKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnDownsample2x, m_module, "downsample2xKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnInitZeroFlow, m_module, "initZeroFlowKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnUpsampleFlow2x, m_module, "upsampleFlow2xKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnPatchMatchLK, m_module, "patchMatchLKFlowKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnCorrelationFlow, m_module, "correlationFlowKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnEmbeddedResidualRefine, m_module, "embeddedResidualRefineKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnJointBilateralFilter, m_module, "jointBilateralFlowFilterKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnJointBilateralUpsample, m_module, "jointBilateralUpsampleKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnPackBidirectional, m_module, "packBidirectionalKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTileMaxVel, m_module, "tileMaxVelKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnNeighborMaxVel, m_module, "neighborMaxVelKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnShutterBlur, m_module, "synthesizeShutterBlurKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnZeroFloatBuffer, m_module, "zeroFloatBufferKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailBaseInit, m_module, "trailBaseInitKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailSplatSubFrame, m_module, "trailSplatSubFrameKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailFinalize, m_module, "trailFinalizeKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnApplySeqFeedback, m_module, "applySeqFeedbackKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnRenderDiagnostic, m_module, "renderDiagnosticViewKernel") == CUDA_SUCCESS_VAL);
+
+    if (!ok) {
+        m_lastError = "cuModuleGetFunction failed for one or more kernels";
+        return false;
+    }
+    return true;
+}
+
+uint64_t CudaEngine::allocDevice(size_t bytes) {
+    if (!initialize() || bytes == 0) return 0;
+    CUdeviceptr ptr = 0;
+    if (g_cu.cuMemAlloc(&ptr, bytes) != CUDA_SUCCESS_VAL) return 0;
+    return ptr;
+}
+
+void CudaEngine::freeDevice(uint64_t dptr) {
+    if (dptr && m_alive.load(std::memory_order_acquire) && m_initialized &&
+        !isProcessShuttingDown() && g_cu.cuMemFree) {
+        g_cu.cuMemFree(dptr);
+    }
+}
+
+uint64_t CudaEngine::acquireScratch(size_t bytes, void* stream) {
+    if (bytes == 0) return 0;
+    const uintptr_t skey = reinterpret_cast<uintptr_t>(stream);
+    {
+        std::lock_guard<std::mutex> lock(m_scratchMutex);
+        auto sit = m_scratchPool.find(skey);
+        if (sit != m_scratchPool.end()) {
+            auto bit = sit->second.find(bytes);
+            if (bit != sit->second.end() && !bit->second.empty()) {
+                uint64_t ptr = bit->second.back();
+                bit->second.pop_back();
+                m_scratchPoolBytes -= bytes;
+                return ptr;
+            }
+        }
+    }
+    return allocDevice(bytes);
+}
+
+void CudaEngine::releaseScratch(uint64_t dptr, size_t bytes, void* stream) {
+    if (!dptr) return;
+    if (!m_alive.load(std::memory_order_acquire) || !m_initialized || isProcessShuttingDown()) {
+        return;
+    }
+    const uintptr_t skey = reinterpret_cast<uintptr_t>(stream);
+    {
+        std::lock_guard<std::mutex> lock(m_scratchMutex);
+        if (m_scratchPoolBytes + bytes <= kMaxScratchPoolBytes) {
+            m_scratchPool[skey][bytes].push_back(dptr);
+            m_scratchPoolBytes += bytes;
+            return;
+        }
+    }
+    freeDevice(dptr);
+}
+
+void CudaEngine::clearScratchPool() {
+    decltype(m_scratchPool) localPool;
+    {
+        std::lock_guard<std::mutex> lock(m_scratchMutex);
+        localPool.swap(m_scratchPool);
+        m_scratchPoolBytes = 0;
+    }
+    if (!isProcessShuttingDown() && g_cu.cuMemFree && m_initialized) {
+        for (const auto& skv : localPool) {
+            for (const auto& bkv : skv.second) {
+                for (uint64_t ptr : bkv.second) {
+                    if (ptr) g_cu.cuMemFree(ptr);
+                }
+            }
+        }
+    }
+}
+
+bool CudaEngine::uploadToDevice(uint64_t dstDev, const void* srcHost, size_t bytes, void* stream) {
+    if (!m_initialized || !dstDev || !srcHost) return false;
+    return g_cu.cuMemcpyHtoDAsync(dstDev, srcHost, bytes, stream) == CUDA_SUCCESS_VAL;
+}
+
+bool CudaEngine::downloadFromDevice(void* dstHost, uint64_t srcDev, size_t bytes, void* stream) {
+    if (!m_initialized || !dstHost || !srcDev) return false;
+    return g_cu.cuMemcpyDtoHAsync(dstHost, srcDev, bytes, stream) == CUDA_SUCCESS_VAL;
+}
+
+bool CudaEngine::copyDeviceToDevice(uint64_t dstDev, uint64_t srcDev, size_t bytes, void* stream) {
+    if (!m_initialized || !dstDev || !srcDev) return false;
+    return g_cu.cuMemcpyDtoDAsync(dstDev, srcDev, bytes, stream) == CUDA_SUCCESS_VAL;
+}
+
+bool CudaEngine::memsetDevice(uint64_t dstDev, unsigned char val, size_t bytes, void* stream) {
+    if (!m_initialized || !dstDev) return false;
+    return g_cu.cuMemsetD8Async(dstDev, val, bytes, stream) == CUDA_SUCCESS_VAL;
+}
+
+bool CudaEngine::syncStream(void* stream) {
+    if (!m_initialized) return false;
+    return g_cu.cuStreamSynchronize(stream) == CUDA_SUCCESS_VAL;
+}
+
+static inline void grid2D(int w, int h, unsigned int bx, unsigned int by, unsigned int& gx, unsigned int& gy) {
+    gx = static_cast<unsigned int>((w + bx - 1) / bx);
+    gy = static_cast<unsigned int>((h + by - 1) / by);
+}
+
+bool CudaEngine::buildPyramid(
+    uint64_t devRGBA, uint64_t devMatte, int matteComp, bool needMatte,
+    int width, int height, PyramidSet& outPyr, void* stream)
+{
+    outPyr = PyramidSet{};
+    outPyr.lw[0] = width;
+    outPyr.lh[0] = height;
+    int numLevels = 1;
+    for (int i = 1; i < PyramidSet::kMaxLevels; ++i) {
+        int nw = outPyr.lw[i - 1] / 2;
+        int nh = outPyr.lh[i - 1] / 2;
+        if (nw < 16 || nh < 16) break;
+        outPyr.lw[i] = nw;
+        outPyr.lh[i] = nh;
+        ++numLevels;
+    }
+    outPyr.numLevels = numLevels;
+    outPyr.hasMatte = needMatte && (devMatte != 0 && matteComp > 0);
+
+    for (int i = 0; i < numLevels; ++i) {
+        size_t sz = static_cast<size_t>(outPyr.lw[i]) * outPyr.lh[i] * sizeof(float);
+        outPyr.luma[i] = acquireScratch(sz, stream);
+        if (!outPyr.luma[i]) {
+            releasePyramid(outPyr, stream);
+            return false;
+        }
+        if (outPyr.hasMatte) {
+            outPyr.matte[i] = acquireScratch(sz, stream);
+            if (!outPyr.matte[i]) {
+                releasePyramid(outPyr, stream);
+                return false;
+            }
+        }
+    }
+
+    const unsigned int bx = 16, by = 16;
+    unsigned int gx = 0, gy = 0;
+    grid2D(width, height, bx, by, gx, gy);
+
+    uint64_t outM0 = outPyr.hasMatte ? outPyr.matte[0] : 0;
+    void* params0[] = {&width, &height, &devRGBA, &devMatte, &matteComp, &outPyr.luma[0], &outM0};
+    g_cu.cuLaunchKernel(m_fnExtractLumaMatte, gx, gy, 1, bx, by, 1, 0, stream, params0, nullptr);
+
+    for (int i = 1; i < numLevels; ++i) {
+        unsigned int lgx = 0, lgy = 0;
+        grid2D(outPyr.lw[i], outPyr.lh[i], bx, by, lgx, lgy);
+        void* pL[] = {&outPyr.lw[i - 1], &outPyr.lh[i - 1], &outPyr.lw[i], &outPyr.lh[i],
+                      &outPyr.luma[i - 1], &outPyr.luma[i]};
+        g_cu.cuLaunchKernel(m_fnDownsample2x, lgx, lgy, 1, bx, by, 1, 0, stream, pL, nullptr);
+        if (outPyr.hasMatte) {
+            void* pM[] = {&outPyr.lw[i - 1], &outPyr.lh[i - 1], &outPyr.lw[i], &outPyr.lh[i],
+                          &outPyr.matte[i - 1], &outPyr.matte[i]};
+            g_cu.cuLaunchKernel(m_fnDownsample2x, lgx, lgy, 1, bx, by, 1, 0, stream, pM, nullptr);
+        }
+    }
+    return true;
+}
+
+void CudaEngine::releasePyramid(PyramidSet& pyr, void* stream) {
+    for (int i = 0; i < pyr.numLevels; ++i) {
+        size_t sz = static_cast<size_t>(pyr.lw[i]) * pyr.lh[i] * sizeof(float);
+        if (pyr.luma[i]) {
+            releaseScratch(pyr.luma[i], sz, stream);
+            pyr.luma[i] = 0;
+        }
+        if (pyr.matte[i]) {
+            releaseScratch(pyr.matte[i], sz, stream);
+            pyr.matte[i] = 0;
+        }
+    }
+    pyr.numLevels = 0;
+    pyr.hasMatte = false;
+}
+
+bool CudaEngine::launchFlowFromPyramids(
+    const PyramidSet& pyrA, const PyramidSet& pyrB,
+    int width, int height,
+    FlowEngineType engineType, float flowDetail, MatteMode matteMode,
+    uint64_t devOutFlow2, void* stream)
+{
+    const int numLevels = pyrA.numLevels;
+    const unsigned int bx = 16, by = 16;
+    unsigned int gx = 0, gy = 0;
+    grid2D(width, height, bx, by, gx, gy);
+
+    int hasMatte = (pyrA.hasMatte && matteMode == eMatteForegroundIsolation) ? 1 : 0;
+
+    // Proxy level target for Neural mode: ~960px proxy width for 4K/HD, full-res for <1024px
+    int finestLevel = 0;
+    if (engineType == eFlowNeural && numLevels > 2) {
+        finestLevel = (width >= 2560) ? 2 : ((width >= 1024) ? 1 : 0);
+    }
+
+    uint64_t devPrevFlow = 0;
+    size_t prevFlowBytes = 0;
+    float sigmaRange = 0.03f + (1.0f - flowDetail) * 0.12f;
+
+    for (int lvl = numLevels - 1; lvl >= finestLevel; --lvl) {
+        int w = pyrA.lw[lvl];
+        int h = pyrA.lh[lvl];
+        size_t flowBytes = static_cast<size_t>(w) * h * sizeof(Float2);
+        uint64_t devFlowIn = acquireScratch(flowBytes, stream);
+        uint64_t devFlowTmp = acquireScratch(flowBytes, stream);
+        if (!devFlowIn || !devFlowTmp) {
+            releaseScratch(devFlowIn, flowBytes, stream);
+            releaseScratch(devFlowTmp, flowBytes, stream);
+            releaseScratch(devPrevFlow, prevFlowBytes, stream);
+            return false;
+        }
+
+        unsigned int lgx = 0, lgy = 0;
+        grid2D(w, h, bx, by, lgx, lgy);
+
+        if (lvl == numLevels - 1) {
+            void* pZero[] = {&w, &h, &devFlowIn};
+            g_cu.cuLaunchKernel(m_fnInitZeroFlow, lgx, lgy, 1, bx, by, 1, 0, stream, pZero, nullptr);
+        } else {
+            int pw = pyrA.lw[lvl + 1], ph = pyrA.lh[lvl + 1];
+            void* pUp[] = {&pw, &ph, &w, &h, &devPrevFlow, &devFlowIn};
+            g_cu.cuLaunchKernel(m_fnUpsampleFlow2x, lgx, lgy, 1, bx, by, 1, 0, stream, pUp, nullptr);
+            releaseScratch(devPrevFlow, prevFlowBytes, stream);
+            devPrevFlow = 0;
+            prevFlowBytes = 0;
+        }
+
+        uint64_t lA = pyrA.luma[lvl];
+        uint64_t mA = pyrA.matte[lvl];
+        uint64_t lB = pyrB.luma[lvl];
+
+        int searchRadius = 0;
+        if (lvl == numLevels - 1) {
+            searchRadius = (numLevels <= 4) ? 5 : 3;
+        } else if (lvl >= 2) {
+            searchRadius = 1;
+        }
+        int lkIters = (lvl <= 1) ? 5 : 4;
+        void* pPMLK[] = {&w, &h, &lA, &mA, &lB, &devFlowIn, &devFlowTmp, &searchRadius, &lkIters, &hasMatte};
+        g_cu.cuLaunchKernel(m_fnPatchMatchLK, lgx, lgy, 1, bx, by, 1, 0, stream, pPMLK, nullptr);
+
+        // Neighbor propagation cleanup pass (eliminates isolated coarse outliers via spatial consensus)
+        if (lvl >= 2) {
+            int zeroRad = 0;
+            int cleanIters = 2;
+            void* pClean[] = {&w, &h, &lA, &mA, &lB, &devFlowTmp, &devFlowIn, &zeroRad, &cleanIters, &hasMatte};
+            g_cu.cuLaunchKernel(m_fnPatchMatchLK, lgx, lgy, 1, bx, by, 1, 0, stream, pClean, nullptr);
+            // Swap buffers cleanly: clean result in devFlowIn -> pJBF reads devFlowIn and writes devFlowTmp
+            void* pJBF[] = {&w, &h, &devFlowIn, &lA, &mA, &sigmaRange, &hasMatte, &devFlowTmp};
+            g_cu.cuLaunchKernel(m_fnJointBilateralFilter, lgx, lgy, 1, bx, by, 1, 0, stream, pJBF, nullptr);
+            std::swap(devFlowIn, devFlowTmp);
+        } else {
+            void* pJBF[] = {&w, &h, &devFlowTmp, &lA, &mA, &sigmaRange, &hasMatte, &devFlowIn};
+            g_cu.cuLaunchKernel(m_fnJointBilateralFilter, lgx, lgy, 1, bx, by, 1, 0, stream, pJBF, nullptr);
+        }
+
+        if (lvl == finestLevel && engineType == eFlowNeural) {
+            const bool useExtOrt = NeuralFlowEngine::instance().initialize() &&
+                                   NeuralFlowEngine::instance().isUsingExternalModel();
+            size_t gradBytes = useExtOrt ? (static_cast<size_t>(w) * h * 2 * sizeof(float)) : 0;
+            uint64_t devGradXY = useExtOrt ? acquireScratch(gradBytes, stream) : 0;
+            void* pCorr[] = {&w, &h, &lA, &mA, &lB, &devFlowIn, &devFlowTmp, &devGradXY};
+            g_cu.cuLaunchKernel(m_fnCorrelationFlow, lgx, lgy, 1, bx, by, 1, 0, stream, pCorr, nullptr);
+
+            if (useExtOrt && devGradXY) {
+                syncStream(stream);
+                const size_t nPix = static_cast<size_t>(w) * h;
+                {
+                    std::lock_guard<std::mutex> lock(m_ortBufMutex);
+                    m_ortFlowBuf.resize(nPix);
+                    m_ortGradBuf.resize(nPix);
+                    m_ortInNchw4.resize(4 * nPix);
+                    m_ortOutNchw2.resize(2 * nPix);
+                    downloadFromDevice(m_ortFlowBuf.data(), devFlowTmp, nPix * sizeof(Float2), stream);
+                    downloadFromDevice(m_ortGradBuf.data(), devGradXY, nPix * sizeof(Float2), stream);
+                    syncStream(stream);
+
+                    for (size_t i = 0; i < nPix; ++i) {
+                        m_ortInNchw4[0 * nPix + i] = m_ortFlowBuf[i].x;
+                        m_ortInNchw4[1 * nPix + i] = m_ortFlowBuf[i].y;
+                        m_ortInNchw4[2 * nPix + i] = m_ortGradBuf[i].x;
+                        m_ortInNchw4[3 * nPix + i] = m_ortGradBuf[i].y;
+                    }
+                    if (NeuralFlowEngine::instance().refineFlow(w, h, m_ortInNchw4.data(), m_ortOutNchw2.data())) {
+                        for (size_t i = 0; i < nPix; ++i) {
+                            m_ortFlowBuf[i].x = m_ortOutNchw2[0 * nPix + i];
+                            m_ortFlowBuf[i].y = m_ortOutNchw2[1 * nPix + i];
+                        }
+                        uploadToDevice(devFlowTmp, m_ortFlowBuf.data(), nPix * sizeof(Float2), stream);
+                    }
+                }
+                releaseScratch(devGradXY, gradBytes, stream);
+
+                void* pJBF2[] = {&w, &h, &devFlowTmp, &lA, &mA, &sigmaRange, &hasMatte, &devFlowIn};
+                g_cu.cuLaunchKernel(m_fnJointBilateralFilter, lgx, lgy, 1, bx, by, 1, 0, stream, pJBF2, nullptr);
+                releaseScratch(devFlowTmp, flowBytes, stream);
+                devPrevFlow = devFlowIn;
+                prevFlowBytes = flowBytes;
+            } else {
+                if (devGradXY) releaseScratch(devGradXY, gradBytes, stream);
+                // GPU-native 3x3 Laplacian refinement matching embedded ONNX graph (zero PCIe roundtrip)
+                void* pEmb[] = {&w, &h, &devFlowTmp, &devFlowIn};
+                g_cu.cuLaunchKernel(m_fnEmbeddedResidualRefine, lgx, lgy, 1, bx, by, 1, 0, stream, pEmb, nullptr);
+
+                void* pJBF2[] = {&w, &h, &devFlowIn, &lA, &mA, &sigmaRange, &hasMatte, &devFlowTmp};
+                g_cu.cuLaunchKernel(m_fnJointBilateralFilter, lgx, lgy, 1, bx, by, 1, 0, stream, pJBF2, nullptr);
+                releaseScratch(devFlowIn, flowBytes, stream);
+                devPrevFlow = devFlowTmp;
+                prevFlowBytes = flowBytes;
+            }
+        } else {
+            releaseScratch(devFlowTmp, flowBytes, stream);
+            devPrevFlow = devFlowIn;
+            prevFlowBytes = flowBytes;
+        }
+    }
+
+    if (finestLevel > 0) {
+        int lwF = pyrA.lw[finestLevel], lhF = pyrA.lh[finestLevel];
+        uint64_t lLow = pyrA.luma[finestLevel];
+        uint64_t lHigh = pyrA.luma[0];
+        uint64_t mHigh = pyrA.matte[0];
+        void* pUpJBU[] = {&lwF, &lhF, &width, &height, &devPrevFlow, &lLow, &lHigh, &mHigh, &sigmaRange, &hasMatte, &devOutFlow2};
+        g_cu.cuLaunchKernel(m_fnJointBilateralUpsample, gx, gy, 1, bx, by, 1, 0, stream, pUpJBU, nullptr);
+        releaseScratch(devPrevFlow, prevFlowBytes, stream);
+    } else {
+        copyDeviceToDevice(devOutFlow2, devPrevFlow, static_cast<size_t>(width) * height * sizeof(Float2), stream);
+        releaseScratch(devPrevFlow, prevFlowBytes, stream);
+    }
+
+    return true;
+}
+
+CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
+    const void* instanceId,
+    int frameAIndex, uint64_t devFrameA, uint64_t devMatteA, int matteAComp,
+    int frameBIndex, uint64_t devFrameB, uint64_t devMatteB, int matteBComp,
+    const RenderParams& params,
+    FlowCache& cache,
+    void* stream)
+{
+    const bool reversed = (frameAIndex > frameBIndex);
+    int fLow = reversed ? frameBIndex : frameAIndex;
+    int fHigh = reversed ? frameAIndex : frameBIndex;
+    uint64_t devLowRGBA = reversed ? devFrameB : devFrameA;
+    uint64_t devHighRGBA = reversed ? devFrameA : devFrameB;
+    uint64_t devLowMatte = reversed ? devMatteB : devMatteA;
+    uint64_t devHighMatte = reversed ? devMatteA : devMatteB;
+    int lowMatteComp = reversed ? matteBComp : matteAComp;
+    int highMatteComp = reversed ? matteAComp : matteBComp;
+
+    FlowCacheKey key{
+        instanceId,
+        fLow,
+        fHigh,
+        params.width,
+        params.height,
+        static_cast<int>(params.flowEngine),
+        static_cast<int>(std::lround(params.flowDetail * 20.0f)),
+        true
+    };
+
+    if (auto cached = cache.get(key)) {
+        return {cached, reversed};
+    }
+
+    const size_t nPix = static_cast<size_t>(params.width) * params.height;
+    const size_t flow2Bytes = nPix * sizeof(Float2);
+    uint64_t devFwd2 = acquireScratch(flow2Bytes, stream);
+    uint64_t devBwd2 = acquireScratch(flow2Bytes, stream);
+
+    auto entry = std::make_shared<FlowEntry>();
+    entry->width = params.width;
+    entry->height = params.height;
+    entry->isGpu = true;
+    entry->devFlow4 = allocDevice(nPix * sizeof(Float4));
+    entry->devConf2 = allocDevice(nPix * sizeof(Float2));
+    entry->byteSize = nPix * (sizeof(Float4) + sizeof(Float2));
+    entry->gpuFreeFn = [this](uint64_t ptr) { this->freeDevice(ptr); };
+
+    if (!devFwd2 || !devBwd2 || !entry->devFlow4 || !entry->devConf2) {
+        releaseScratch(devFwd2, flow2Bytes, stream);
+        releaseScratch(devBwd2, flow2Bytes, stream);
+        return {nullptr, reversed};
+    }
+
+    const bool needMatte = (params.matteMode == eMatteForegroundIsolation);
+    PyramidSet pyrLow, pyrHigh;
+    if (!buildPyramid(devLowRGBA, devLowMatte, lowMatteComp, needMatte, params.width, params.height, pyrLow, stream) ||
+        !buildPyramid(devHighRGBA, devHighMatte, highMatteComp, needMatte, params.width, params.height, pyrHigh, stream)) {
+        releasePyramid(pyrLow, stream);
+        releasePyramid(pyrHigh, stream);
+        releaseScratch(devFwd2, flow2Bytes, stream);
+        releaseScratch(devBwd2, flow2Bytes, stream);
+        return {nullptr, reversed};
+    }
+
+    bool ok1 = launchFlowFromPyramids(pyrLow, pyrHigh, params.width, params.height,
+                                       params.flowEngine, params.flowDetail, params.matteMode,
+                                       devFwd2, stream);
+    bool ok2 = ok1 && launchFlowFromPyramids(pyrHigh, pyrLow, params.width, params.height,
+                                              params.flowEngine, params.flowDetail, params.matteMode,
+                                              devBwd2, stream);
+
+    releasePyramid(pyrLow, stream);
+    releasePyramid(pyrHigh, stream);
+
+    if (!ok1 || !ok2) {
+        releaseScratch(devFwd2, flow2Bytes, stream);
+        releaseScratch(devBwd2, flow2Bytes, stream);
+        return {nullptr, reversed};
+    }
+
+    const unsigned int bx = 16, by = 16;
+    unsigned int gx = 0, gy = 0;
+    grid2D(params.width, params.height, bx, by, gx, gy);
+
+    void* pPack[] = {const_cast<int*>(&params.width), const_cast<int*>(&params.height),
+                     &devFwd2, &devBwd2, &entry->devFlow4, &entry->devConf2};
+    g_cu.cuLaunchKernel(m_fnPackBidirectional, gx, gy, 1, bx, by, 1, 0, stream, pPack, nullptr);
+
+    releaseScratch(devFwd2, flow2Bytes, stream);
+    releaseScratch(devBwd2, flow2Bytes, stream);
+
+    cache.put(key, entry);
+    return {entry, reversed};
+}
+
+std::shared_ptr<FlowEntry> CudaEngine::getOrComputeFlowPair(
+    const void* instanceId,
+    int frameAIndex, uint64_t devFrameA, uint64_t devMatteA, int matteAComp,
+    int frameBIndex, uint64_t devFrameB, uint64_t devMatteB, int matteBComp,
+    const RenderParams& params,
+    FlowCache& cache,
+    void* stream)
+{
+    return getOrComputeFlowPairCanonical(
+               instanceId,
+               frameAIndex, devFrameA, devMatteA, matteAComp,
+               frameBIndex, devFrameB, devMatteB, matteBComp,
+               params, cache, stream).entry;
+}
+
+bool CudaEngine::renderFrame(
+    const void* instanceId,
+    const std::vector<FrameInput>& frames,
+    int centerIdx,
+    uint64_t devOutputRGBA,
+    const RenderParams& params,
+    FlowCache& cache,
+    void* stream)
+{
+    if (!initialize() || centerIdx < 0 || centerIdx >= static_cast<int>(frames.size())) {
+        return false;
+    }
+
+    const int w = params.width;
+    const int h = params.height;
+    const size_t nPix = static_cast<size_t>(w) * h;
+    const FrameInput& curr = frames[centerIdx];
+
+    const unsigned int bx = 16, by = 16;
+    unsigned int gx = 0, gy = 0;
+    grid2D(w, h, bx, by, gx, gy);
+
+    // Extract single-channel matte for current frame if available
+    uint64_t devCurrMatte = 0;
+    const size_t floatBufBytes = nPix * sizeof(float);
+    int hasMatte = (curr.deviceMatte != 0 && curr.matteComponents > 0 && params.matteMode != eMatteIgnore) ? 1 : 0;
+    if (hasMatte) {
+        devCurrMatte = acquireScratch(floatBufBytes, stream);
+        uint64_t tmpLuma = acquireScratch(floatBufBytes, stream);
+        int comp = curr.matteComponents;
+        void* pEx[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                       const_cast<uint64_t*>(&curr.deviceRGBA), const_cast<uint64_t*>(&curr.deviceMatte),
+                       &comp, &tmpLuma, &devCurrMatte};
+        g_cu.cuLaunchKernel(m_fnExtractLumaMatte, gx, gy, 1, bx, by, 1, 0, stream, pEx, nullptr);
+        releaseScratch(tmpLuma, floatBufBytes, stream);
+    }
+
+    // Compute bidirectional flow around center frame t -> t+1 and t -> t-1 only when needed
+    FlowPairResult flowFwdRes;
+    FlowPairResult flowBwdRes;
+    const bool needsCenterFlow = (params.viewMode != eViewFinal) ||
+                                 (params.mode == eModeShutterBlur) ||
+                                 (params.mode == eModeCombined);
+
+    if (needsCenterFlow) {
+        if (centerIdx + 1 < static_cast<int>(frames.size())) {
+            const auto& nextF = frames[centerIdx + 1];
+            flowFwdRes = getOrComputeFlowPairCanonical(
+                instanceId,
+                curr.frameIndex, curr.deviceRGBA, curr.deviceMatte, curr.matteComponents,
+                nextF.frameIndex, nextF.deviceRGBA, nextF.deviceMatte, nextF.matteComponents,
+                params, cache, stream);
+        }
+        if (centerIdx - 1 >= 0) {
+            const auto& prevF = frames[centerIdx - 1];
+            flowBwdRes = getOrComputeFlowPairCanonical(
+                instanceId,
+                curr.frameIndex, curr.deviceRGBA, curr.deviceMatte, curr.matteComponents,
+                prevF.frameIndex, prevF.deviceRGBA, prevF.deviceMatte, prevF.matteComponents,
+                params, cache, stream);
+        }
+    }
+
+    // Diagnostic views
+    if (params.viewMode != eViewFinal) {
+        int vm = static_cast<int>(params.viewMode);
+        const FlowPairResult& diagFlow = flowFwdRes.entry ? flowFwdRes : flowBwdRes;
+        uint64_t f4 = diagFlow.entry ? diagFlow.entry->devFlow4 : 0;
+        uint64_t c2 = diagFlow.entry ? diagFlow.entry->devConf2 : 0;
+        int diagRev = diagFlow.reversed ? 1 : 0;
+        float sens = params.motionSensitivity;
+        float mt = params.motionThreshold;
+        float lt = params.lumaThreshold;
+        void* pDiag[] = {const_cast<int*>(&w), const_cast<int*>(&h), &vm,
+                         const_cast<uint64_t*>(&curr.deviceRGBA), &f4, &c2, &diagRev,
+                         &devCurrMatte, &hasMatte,
+                         &sens, &mt, &lt, &devOutputRGBA};
+        g_cu.cuLaunchKernel(m_fnRenderDiagnostic, gx, gy, 1, bx, by, 1, 0, stream, pDiag, nullptr);
+        if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
+        return true;
+    }
+
+    uint64_t intermediateShutterOut = 0;
+    const size_t rgbaBytes = nPix * 4 * sizeof(float);
+    uint64_t shutterSrcRGBA = curr.deviceRGBA;
+
+    // Pass 1: Natural Shutter Blur (if eModeShutterBlur or eModeCombined)
+    if (params.mode == eModeShutterBlur || params.mode == eModeCombined) {
+        const int tileSize = 16;
+        const int tileW = (w + tileSize - 1) / tileSize;
+        const int tileH = (h + tileSize - 1) / tileSize;
+        const size_t tileBytes = static_cast<size_t>(tileW) * tileH * sizeof(Float2);
+        uint64_t devTileMax = acquireScratch(tileBytes, stream);
+        uint64_t devNeighborMax = acquireScratch(tileBytes, stream);
+
+        unsigned int tgx = 0, tgy = 0;
+        grid2D(tileW, tileH, bx, by, tgx, tgy);
+
+        uint64_t f4Fwd = flowFwdRes.entry ? flowFwdRes.entry->devFlow4 : 0;
+        int fwdRev = flowFwdRes.reversed ? 1 : 0;
+        uint64_t f4Bwd = flowBwdRes.entry ? flowBwdRes.entry->devFlow4 : 0;
+        int bwdRev = flowBwdRes.reversed ? 1 : 0;
+        uint64_t c2Ptr = flowFwdRes.entry ? flowFwdRes.entry->devConf2 : (flowBwdRes.entry ? flowBwdRes.entry->devConf2 : 0);
+        float sens = params.motionSensitivity;
+        float mt = params.motionThreshold;
+
+        // 1 block of 16x16 threads per tile for coalesced parallel max reduction
+        void* pTile[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                         const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
+                         &f4Fwd, &fwdRev, &f4Bwd, &bwdRev, &sens, &mt, &devTileMax};
+        g_cu.cuLaunchKernel(m_fnTileMaxVel, static_cast<unsigned int>(tileW), static_cast<unsigned int>(tileH), 1,
+                            16, 16, 1, 0, stream, pTile, nullptr);
+
+        void* pNeigh[] = {const_cast<int*>(&tileW), const_cast<int*>(&tileH), &devTileMax, &devNeighborMax};
+        g_cu.cuLaunchKernel(m_fnNeighborMaxVel, tgx, tgy, 1, bx, by, 1, 0, stream, pNeigh, nullptr);
+
+        uint64_t targetBuf = devOutputRGBA;
+        if (params.mode == eModeCombined) {
+            intermediateShutterOut = acquireScratch(rgbaBytes, stream);
+            targetBuf = intermediateShutterOut;
+        }
+
+        int mMode = static_cast<int>(params.matteMode);
+        float sAngle = params.shutterAngle;
+        float sPhase = params.shutterPhase;
+        int sSamples = params.shutterSamples;
+        float hBoost = params.highlightBoost;
+
+        void* pBlur[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                         const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
+                         const_cast<uint64_t*>(&curr.deviceRGBA),
+                         &f4Fwd, &fwdRev, &f4Bwd, &bwdRev, &c2Ptr, &devNeighborMax,
+                         &devCurrMatte, &hasMatte, &mMode,
+                         &sAngle, &sPhase, &sSamples,
+                         &sens, &mt, &hBoost,
+                         &targetBuf};
+        g_cu.cuLaunchKernel(m_fnShutterBlur, gx, gy, 1, bx, by, 1, 0, stream, pBlur, nullptr);
+
+        releaseScratch(devTileMax, tileBytes, stream);
+        releaseScratch(devNeighborMax, tileBytes, stream);
+
+        if (params.mode == eModeShutterBlur) {
+            if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
+            return true;
+        }
+        shutterSrcRGBA = intermediateShutterOut;
+    }
+
+    // Pass 2: Long-Exposure Motion Trail (eModeLongExposureTrail or eModeCombined)
+    uint64_t devAccum = acquireScratch(rgbaBytes, stream);
+    int totalFloats = static_cast<int>(nPix * 4);
+    unsigned int zBlocks = static_cast<unsigned int>((totalFloats + 255) / 256);
+    void* pZero[] = {&totalFloats, &devAccum};
+    g_cu.cuLaunchKernel(m_fnZeroFloatBuffer, zBlocks, 1, 1, 256, 1, 1, 0, stream, pZero, nullptr);
+
+    int bMode = static_cast<int>(params.trailBlendMode);
+    void* pInit[] = {const_cast<int*>(&w), const_cast<int*>(&h), &shutterSrcRGBA, &bMode, &devAccum};
+    g_cu.cuLaunchKernel(m_fnTrailBaseInit, gx, gy, 1, bx, by, 1, 0, stream, pInit, nullptr);
+
+    const int maxLookback = std::min(centerIdx, std::max(1, params.trailFrames - 1));
+    int mMode = static_cast<int>(params.matteMode);
+    int subSteps = params.subFrameSteps;
+    float decay = params.trailDecay;
+    float sens = params.motionSensitivity;
+    float mt = params.motionThreshold;
+    float lt = params.lumaThreshold;
+    float hBoost = params.highlightBoost;
+
+    for (int k = 0; k <= maxLookback; ++k) {
+        int idxA = centerIdx - k;
+        int idxB = idxA - 1;
+        const FrameInput& fA = frames[idxA];
+        uint64_t rgbaA = (k == 0) ? shutterSrcRGBA : fA.deviceRGBA;
+
+        int hasB = (idxB >= 0 && k < maxLookback) ? 1 : 0;
+        uint64_t rgbaB = hasB ? frames[idxB].deviceRGBA : rgbaA;
+
+        FlowPairResult pairFlowRes;
+        if (hasB) {
+            pairFlowRes = getOrComputeFlowPairCanonical(
+                instanceId,
+                fA.frameIndex, rgbaA, fA.deviceMatte, fA.matteComponents,
+                frames[idxB].frameIndex, rgbaB, frames[idxB].deviceMatte, frames[idxB].matteComponents,
+                params, cache, stream);
+        }
+
+        uint64_t matteA = 0;
+        if (hasMatte) {
+            matteA = (k == 0) ? devCurrMatte : acquireScratch(floatBufBytes, stream);
+            if (k > 0 && fA.deviceMatte && fA.matteComponents > 0) {
+                uint64_t tmpL = acquireScratch(floatBufBytes, stream);
+                int comp = fA.matteComponents;
+                void* pEx[] = {const_cast<int*>(&w), const_cast<int*>(&h), &rgbaA,
+                               const_cast<uint64_t*>(&fA.deviceMatte), &comp, &tmpL, &matteA};
+                g_cu.cuLaunchKernel(m_fnExtractLumaMatte, gx, gy, 1, bx, by, 1, 0, stream, pEx, nullptr);
+                releaseScratch(tmpL, floatBufBytes, stream);
+            }
+        }
+
+        uint64_t f4 = pairFlowRes.entry ? pairFlowRes.entry->devFlow4 : 0;
+        uint64_t c2 = pairFlowRes.entry ? pairFlowRes.entry->devConf2 : 0;
+        int flowRev = pairFlowRes.reversed ? 1 : 0;
+        int pairAge = k;
+        void* pSplat[] = {
+            const_cast<int*>(&w), const_cast<int*>(&h),
+            &rgbaA, &rgbaB, &f4, &c2, &flowRev,
+            &matteA, &hasMatte, &mMode,
+            &pairAge, &subSteps, &hasB,
+            &bMode, &decay, &sens, &mt, &lt,
+            &hBoost, &devAccum
+        };
+        g_cu.cuLaunchKernel(m_fnTrailSplatSubFrame, gx, gy, 1, bx, by, 1, 0, stream, pSplat, nullptr);
+
+        if (k > 0 && matteA) releaseScratch(matteA, floatBufBytes, stream);
+    }
+
+    float crisp = params.rearCurtainCrispness;
+    void* pFin[] = {
+        const_cast<int*>(&w), const_cast<int*>(&h),
+        &shutterSrcRGBA, &devAccum, &devCurrMatte,
+        &hasMatte, &mMode,
+        &bMode, &crisp,
+        &devOutputRGBA
+    };
+    g_cu.cuLaunchKernel(m_fnTrailFinalize, gx, gy, 1, bx, by, 1, 0, stream, pFin, nullptr);
+
+    // Optional Sequential Accumulation Cache for ultra-long trails
+    if (params.sequentialCache) {
+        auto seq = cache.getOrCreateSequentialState(instanceId);
+        if (!seq->isGpu || seq->width != w || seq->height != h || seq->lastFrame != curr.frameIndex - 1) {
+            seq->reset();
+            seq->isGpu = true;
+            seq->width = w;
+            seq->height = h;
+            seq->devAccumRGBA = allocDevice(rgbaBytes);
+            seq->gpuFreeFn = [this](uint64_t ptr) { this->freeDevice(ptr); };
+            if (seq->devAccumRGBA) {
+                copyDeviceToDevice(seq->devAccumRGBA, devOutputRGBA, rgbaBytes, stream);
+            }
+        } else if (seq->devAccumRGBA) {
+            void* pSeq[] = {const_cast<int*>(&w), const_cast<int*>(&h), &decay, &bMode, &seq->devAccumRGBA, &devOutputRGBA};
+            g_cu.cuLaunchKernel(m_fnApplySeqFeedback, gx, gy, 1, bx, by, 1, 0, stream, pSeq, nullptr);
+            copyDeviceToDevice(seq->devAccumRGBA, devOutputRGBA, rgbaBytes, stream);
+        }
+        seq->lastFrame = curr.frameIndex;
+    }
+
+    releaseScratch(devAccum, rgbaBytes, stream);
+    if (intermediateShutterOut) releaseScratch(intermediateShutterOut, rgbaBytes, stream);
+    if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
+    return true;
+}
+
+bool CudaEngine::renderHostFrames(
+    const void* instanceId,
+    const std::vector<FrameInput>& hostFrames,
+    int centerIdx,
+    float* hostOutputRGBA,
+    const RenderParams& params,
+    FlowCache& cache)
+{
+    if (!initialize() || !hostOutputRGBA) return false;
+    const size_t nPix = static_cast<size_t>(params.width) * params.height;
+    const size_t rgbaBytes = nPix * 4 * sizeof(float);
+
+    std::vector<FrameInput> gpuFrames(hostFrames.size());
+    bool allocOk = true;
+    for (size_t i = 0; i < hostFrames.size(); ++i) {
+        gpuFrames[i].frameIndex = hostFrames[i].frameIndex;
+        gpuFrames[i].deviceRGBA = allocDevice(rgbaBytes);
+        if (!gpuFrames[i].deviceRGBA) {
+            allocOk = false;
+            break;
+        }
+        uploadToDevice(gpuFrames[i].deviceRGBA, hostFrames[i].hostRGBA, rgbaBytes);
+
+        if (hostFrames[i].hostMatte && hostFrames[i].matteComponents > 0) {
+            size_t mBytes = nPix * hostFrames[i].matteComponents * sizeof(float);
+            gpuFrames[i].deviceMatte = allocDevice(mBytes);
+            if (!gpuFrames[i].deviceMatte) {
+                allocOk = false;
+                break;
+            }
+            gpuFrames[i].matteComponents = hostFrames[i].matteComponents;
+            uploadToDevice(gpuFrames[i].deviceMatte, hostFrames[i].hostMatte, mBytes);
+        }
+    }
+
+    uint64_t devOut = allocOk ? allocDevice(rgbaBytes) : 0;
+    bool ok = (allocOk && devOut) ? renderFrame(instanceId, gpuFrames, centerIdx, devOut, params, cache, nullptr) : false;
+    if (ok) {
+        downloadFromDevice(hostOutputRGBA, devOut, rgbaBytes);
+        syncStream(nullptr);
+    }
+
+    freeDevice(devOut);
+    for (auto& gf : gpuFrames) {
+        freeDevice(gf.deviceRGBA);
+        freeDevice(gf.deviceMatte);
+    }
+    return ok;
+}
+
+void CudaEngine::shutdown() {
+    if (isProcessShuttingDown()) {
+        clearScratchPool();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_module = nullptr;
+        m_ownedCtx = nullptr;
+        m_initialized = false;
+        m_attemptedInit = false;
+        return;
+    }
+
+    // Release any GPU allocations held by the global cache and scratch pool before tearing down module/context.
+    FlowCache::global().clear();
+    clearScratchPool();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_module && g_cu.cuModuleUnload) {
+        g_cu.cuModuleUnload(m_module);
+        m_module = nullptr;
+    }
+    if (m_ownedCtx && g_cu.cuCtxDestroy) {
+        g_cu.cuCtxDestroy(m_ownedCtx);
+        m_ownedCtx = nullptr;
+    }
+    m_initialized = false;
+    m_attemptedInit = false;
+}
+
+} // namespace bmb

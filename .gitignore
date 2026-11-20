@@ -1,0 +1,24 @@
+# CMake & Visual Studio build outputs
+build/
+out/
+.vs/
+*.user
+*.suo
+*.sln
+*.slnx
+*.vcxproj*
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Compiled binaries & artifacts
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.dll
+*.exe
+*.ofx
+*.ofx.bundle/
