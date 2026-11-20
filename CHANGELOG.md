@@ -2,6 +2,10 @@
 # Changelog
 
 ## [Unreleased]
+
+<!-- FROZEN_PUSHED_HISTORY -->
+
+## [v1.0.0] - 2026-11-20
 ### Added
 - Native OpenFX 1.4 plugin (`BetterMotionBlur.ofx.bundle`) for DaVinci Resolve on Windows with CUDA (runtime-compiled via NVRTC) and multithreaded CPU fallback.
 - Dual optical flow engines: Neural Optical Flow (`neuflow_v2.onnx` via ORT 1.13.1 or GPU-native `embeddedResidualRefineKernel`) and Fast CUDA Pyramidal (`PatchMatch + Lucas-Kanade`), with 4K Joint-Bilateral Guided Upsampling.
@@ -11,6 +15,4 @@
 - Built-in Diagnostic Views (`Motion Vectors HSV`, `Occlusion Confidence`, `Trail Motion/Luma Mask`).
 - Canonical bidirectional `FlowCache` (`1.5 GB` LRU), stream-keyed GPU scratch pool (`512 MB` cap), and graceful OFX `unload()` / Windows Loader-Lock safe teardown.
 - Automated 8-test verification and 1080p/4K benchmark suite (`BetterMotionBlurTests.exe`).
-- Recorded GNU GPLv3 (`GPL-3.0-or-later`) release licensing intent in `docs/00-Project-Intent-and-Overview.md`.
-
-<!-- FROZEN_PUSHED_HISTORY -->
+- GNU GPLv3 (`GPL-3.0-or-later`) `LICENSE`, `THIRD_PARTY_NOTICES.md`, and project-level documentation (`docs/`).
