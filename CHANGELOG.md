@@ -11,5 +11,6 @@
 - Built-in Diagnostic Views (`Motion Vectors HSV`, `Occlusion Confidence`, `Trail Motion/Luma Mask`).
 - Canonical bidirectional `FlowCache` (`1.5 GB` LRU), stream-keyed GPU scratch pool (`512 MB` cap), and graceful OFX `unload()` / Windows Loader-Lock safe teardown.
 - Automated 8-test verification and 1080p/4K benchmark suite (`BetterMotionBlurTests.exe`).
+- Recorded GNU GPLv3 (`GPL-3.0-or-later`) release licensing intent in `docs/00-Project-Intent-and-Overview.md`.
 
 <!-- FROZEN_PUSHED_HISTORY -->

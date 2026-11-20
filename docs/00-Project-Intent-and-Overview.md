@@ -18,6 +18,8 @@
    - Optimized for real-time 1080p/4K GPU playback with shared-memory CUDA kernels, stream-keyed scratch buffer pooling, canonical bidirectional flow caching, and GPU-native embedded neural refinement.
 5. **Graceful Unload & Process Exit**:
    - Cleanly frees GPU buffers, CUDA modules/contexts, and ONNX Runtime sessions via OFX `unload()` (`kOfxActionUnload`) and guards against Windows OS Loader-Lock deadlocks/crashes on `ExitProcess`.
+6. **Open-Source Licensing (GNU GPLv3)**:
+   - Released under **GNU GPLv3** (`GPL-3.0-or-later`), with a root `LICENSE` file and any required third-party notices (e.g., OpenFX SDK BSD-3-Clause attribution and host/runtime exception notes for binary distributions).
 
 ---
 
