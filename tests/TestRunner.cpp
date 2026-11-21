@@ -171,9 +171,8 @@ int main() {
             CudaEngine::instance().syncStream(nullptr);
             if (!entry) return 999.0;
 
-            std::vector<Float4> hostFlow(static_cast<size_t>(w) * h);
-            CudaEngine::instance().downloadFromDevice(hostFlow.data(), entry->devFlow4, hostFlow.size() * sizeof(Float4));
-            CudaEngine::instance().syncStream(nullptr);
+            std::vector<Float4> hostFlow;
+            if (!CudaEngine::instance().downloadFlowToHost(*entry, hostFlow, nullptr)) return 999.0;
 
             double sumErr = 0.0;
             size_t count = 0;
@@ -473,6 +472,549 @@ int main() {
                       warm4KN, warm4KN > 0 ? 1000.0 / warm4KN : 0.0);
         report("Test 8: GPU Performance & Canonical Cache Reuse",
                b1 && b2 && b3 && hit1080N >= 50.0 && hit1080P >= 50.0 && hit4KN >= 50.0, buf);
+    }
+
+    // Test 9: Long-Exposure Mode Parity, 4K Cache Non-Thrashing & Performance
+    {
+        // 9A: Numerical parity GPU vs exact scalar reference (using GPU flow) AND end-to-end CPU fallback
+        //     across Physical Exposure & Comet Decay, plus diagonal >40px fallback path, Sequential Cache, and Combined.
+        bool parityOk = true;
+        double refDiffPhys = 0.0, refDiffComet = 0.0;
+        double cpuDiffPhys = 0.0, cpuDiffComet = 0.0;
+        float diagFallbackMinR = 0.0f, diagFallbackBg = 1.0f;
+        float seqPersistR = 0.0f;
+        double combinedPolluteDiff = 0.0;
+
+        {
+            const int pw = 256, ph = 144;
+            const int nFrames = 6;
+            std::vector<std::vector<float>> texFrames(nFrames);
+            std::vector<FrameInput> fInputs(nFrames);
+            for (int i = 0; i < nFrames; ++i) {
+                texFrames[i] = makeTranslatedTextureFrame(pw, ph, i * 6.0f, -2.0f * i);
+                fInputs[i] = {i, texFrames[i].data(), 0, nullptr, 0, 0};
+            }
+
+            auto evalMeanDiff = [&](const std::vector<float>& a, const std::vector<float>& b, int margin) {
+                double sum = 0.0;
+                size_t cnt = 0;
+                for (int y = margin; y < ph - margin; ++y) {
+                    for (int x = margin; x < pw - margin; ++x) {
+                        size_t idx = (static_cast<size_t>(y) * pw + x) * 4;
+                        for (int c = 0; c < 3; ++c) {
+                            sum += std::abs(a[idx + c] - b[idx + c]);
+                            ++cnt;
+                        }
+                    }
+                }
+                return sum / std::max<size_t>(1, cnt);
+            };
+
+            auto dwiToLin = [](float v) -> float {
+                return (v <= 0.02740668f) ? (v / 10.44426855f) : (std::exp2(v / 0.07329248f - 7.0f) - 0.0075f);
+            };
+            auto linToDwi = [](float l) -> float {
+                return (l <= 0.00262409f) ? (l * 10.44426855f) : ((std::log2(l + 0.0075f) + 7.0f) * 0.07329248f);
+            };
+            auto dwgLuma = [](float r, float g, float b) -> float {
+                return std::max(0.0f, 0.27411851f * r + 0.87363190f * g - 0.14775041f * b);
+            };
+            auto sampleRGBA = [&](const float* img, float x, float y) -> Float4 {
+                float cx = std::min(static_cast<float>(pw - 1), std::max(0.0f, x));
+                float cy = std::min(static_cast<float>(ph - 1), std::max(0.0f, y));
+                int x0 = static_cast<int>(std::floor(cx));
+                int y0 = static_cast<int>(std::floor(cy));
+                int x1 = std::min(x0 + 1, pw - 1);
+                int y1 = std::min(y0 + 1, ph - 1);
+                float fx = cx - x0, fy = cy - y0;
+                float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+                const float* p00 = img + (y0 * pw + x0) * 4;
+                const float* p10 = img + (y0 * pw + x1) * 4;
+                const float* p01 = img + (y1 * pw + x0) * 4;
+                const float* p11 = img + (y1 * pw + x1) * 4;
+                return {
+                    p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11,
+                    p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11,
+                    p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11,
+                    p00[3] * w00 + p10[3] * w10 + p01[3] * w01 + p11[3] * w11
+                };
+            };
+            auto sampleFwdXY = [&](const std::vector<Float4>& f4, float x, float y) -> Float2 {
+                float cx = std::min(static_cast<float>(pw - 1), std::max(0.0f, x));
+                float cy = std::min(static_cast<float>(ph - 1), std::max(0.0f, y));
+                int x0 = static_cast<int>(std::floor(cx));
+                int y0 = static_cast<int>(std::floor(cy));
+                int x1 = std::min(x0 + 1, pw - 1);
+                int y1 = std::min(y0 + 1, ph - 1);
+                float fx = cx - x0, fy = cy - y0;
+                float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+                const Float4& v00 = f4[y0 * pw + x0];
+                const Float4& v10 = f4[y0 * pw + x1];
+                const Float4& v01 = f4[y1 * pw + x0];
+                const Float4& v11 = f4[y1 * pw + x1];
+                return {v00.x * w00 + v10.x * w10 + v01.x * w01 + v11.x * w11,
+                        v00.y * w00 + v10.y * w10 + v01.y * w01 + v11.y * w11};
+            };
+
+            auto evalScalarTrailReference = [&](const RenderParams& p, const std::vector<std::vector<Float4>>& pairFlows) {
+                const int centerIdx = nFrames - 1;
+                const int maxLookback = std::min(centerIdx, std::max(1, p.trailFrames - 1));
+                const size_t nPix = static_cast<size_t>(pw) * ph;
+                std::vector<float> accum(nPix * 4, 0.0f);
+                const float* curr = fInputs[centerIdx].hostRGBA;
+                for (size_t i = 0; i < nPix; ++i) {
+                    accum[i * 4 + 0] = dwiToLin(curr[i * 4 + 0]) * 0.02f;
+                    accum[i * 4 + 1] = dwiToLin(curr[i * 4 + 1]) * 0.02f;
+                    accum[i * 4 + 2] = dwiToLin(curr[i * 4 + 2]) * 0.02f;
+                    accum[i * 4 + 3] = 0.02f;
+                }
+                const float decayLambda = 0.25f + 3.2f * p.trailDecay;
+                for (int k = 0; k <= maxLookback; ++k) {
+                    int idxA = centerIdx - k;
+                    int idxB = idxA - 1;
+                    const float* rgbaA = fInputs[idxA].hostRGBA;
+                    bool hasB = (idxB >= 0 && k < maxLookback);
+                    const float* rgbaB = hasB ? fInputs[idxB].hostRGBA : rgbaA;
+                    for (int y = 0; y < ph; ++y) {
+                        for (int x = 0; x < pw; ++x) {
+                            size_t idx = static_cast<size_t>(y) * pw + x;
+                            float rA = dwiToLin(rgbaA[idx * 4 + 0]);
+                            float gA = dwiToLin(rgbaA[idx * 4 + 1]);
+                            float bA = dwiToLin(rgbaA[idx * 4 + 2]);
+                            float luma = dwgLuma(rA, gA, bA);
+                            float hdrW = 1.0f + p.highlightBoost * std::pow(std::max(0.0f, luma - 0.8f), 1.5f);
+                            Float2 fl = hasB ? Float2{pairFlows[k][idx].z, pairFlows[k][idx].w} : Float2{0.0f, 0.0f};
+                            float vx = fl.x * p.motionSensitivity;
+                            float vy = fl.y * p.motionSensitivity;
+                            float speed = std::hypot(vx, vy);
+                            if (p.subFrameSteps <= 1 || !hasB || speed < 0.35f) {
+                                float timeW = (p.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * k) : 1.0f;
+                                float wTot = timeW * hdrW;
+                                accum[idx * 4 + 0] += rA * wTot;
+                                accum[idx * 4 + 1] += gA * wTot;
+                                accum[idx * 4 + 2] += bA * wTot;
+                                accum[idx * 4 + 3] += wTot;
+                                continue;
+                            }
+                            int steps = std::max(p.subFrameSteps, std::min(72, static_cast<int>(std::ceil(speed * 1.25f))));
+                            float invSteps = 1.0f / steps;
+                            Float4 pB = sampleRGBA(rgbaB, x + fl.x, y + fl.y);
+                            pB.x = dwiToLin(pB.x); pB.y = dwiToLin(pB.y); pB.z = dwiToLin(pB.z);
+                            Float2 fDest = sampleFwdXY(pairFlows[k], x + fl.x, y + fl.y);
+                            float errSq = (fl.x + fDest.x) * (fl.x + fDest.x) + (fl.y + fDest.y) * (fl.y + fDest.y);
+                            float conf = std::round(std::min(1.0f, std::max(0.0f, std::exp(-errSq * 0.25f))) * 255.0f) / 255.0f;
+                            for (int s = 0; s < steps; ++s) {
+                                float alpha = s * invSteps;
+                                float px = x + alpha * vx, py = y + alpha * vy;
+                                float bb = alpha * conf;
+                                float sr = rA * (1.0f - bb) + pB.x * bb;
+                                float sg = gA * (1.0f - bb) + pB.y * bb;
+                                float sb = bA * (1.0f - bb) + pB.z * bb;
+                                float timeW = (p.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * (k + alpha)) : 1.0f;
+                                int x0 = static_cast<int>(std::floor(px)), y0 = static_cast<int>(std::floor(py));
+                                float fx = px - x0, fy = py - y0;
+                                float bw[4] = {(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy};
+                                int ox[4] = {x0, x0 + 1, x0, x0 + 1}, oy[4] = {y0, y0, y0 + 1, y0 + 1};
+                                float wStep = timeW * hdrW * invSteps;
+                                for (int c = 0; c < 4; ++c) {
+                                    if (bw[c] > 1e-4f && ox[c] >= 0 && ox[c] < pw && oy[c] >= 0 && oy[c] < ph) {
+                                        size_t tidx = static_cast<size_t>(oy[c]) * pw + ox[c];
+                                        float wt = wStep * bw[c];
+                                        accum[tidx * 4 + 0] += sr * wt;
+                                        accum[tidx * 4 + 1] += sg * wt;
+                                        accum[tidx * 4 + 2] += sb * wt;
+                                        accum[tidx * 4 + 3] += wt;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                std::vector<float> out(nPix * 4, 1.0f);
+                for (size_t i = 0; i < nPix; ++i) {
+                    float wSum = std::max(1e-5f, accum[i * 4 + 3]);
+                    float or_ = accum[i * 4 + 0] / wSum, og_ = accum[i * 4 + 1] / wSum, ob_ = accum[i * 4 + 2] / wSum;
+                    if (p.trailBlendMode == eTrailCometDecay && p.rearCurtainCrispness > 0.0f) {
+                        float crisp = std::min(1.0f, std::max(0.0f, p.rearCurtainCrispness));
+                        or_ = or_ * (1.0f - crisp) + dwiToLin(curr[i * 4 + 0]) * crisp;
+                        og_ = og_ * (1.0f - crisp) + dwiToLin(curr[i * 4 + 1]) * crisp;
+                        ob_ = ob_ * (1.0f - crisp) + dwiToLin(curr[i * 4 + 2]) * crisp;
+                    }
+                    out[i * 4 + 0] = linToDwi(or_);
+                    out[i * 4 + 1] = linToDwi(og_);
+                    out[i * 4 + 2] = linToDwi(ob_);
+                }
+                return out;
+            };
+
+            // Download GPU flow pairs once for exact scalar reference comparison
+            std::vector<std::vector<Float4>> gpuPairFlows(nFrames - 1);
+            {
+                const size_t rgbaBytes = static_cast<size_t>(pw) * ph * 4 * sizeof(float);
+                std::vector<uint64_t> devTex(nFrames, 0);
+                for (int i = 0; i < nFrames; ++i) {
+                    devTex[i] = CudaEngine::instance().allocDevice(rgbaBytes);
+                    CudaEngine::instance().uploadToDevice(devTex[i], fInputs[i].hostRGBA, rgbaBytes);
+                }
+                FlowCache refFlowCache;
+                RenderParams fp;
+                fp.width = pw; fp.height = ph;
+                fp.flowEngine = eFlowCudaPyramidal;
+                for (int k = 0; k < nFrames - 1; ++k) {
+                    int idxA = (nFrames - 1) - k;
+                    int idxB = idxA - 1;
+                    auto entry = CudaEngine::instance().getOrComputeFlowPair(
+                        &fp, idxA, devTex[idxA], 0, 0, idxB, devTex[idxB], 0, 0, fp, refFlowCache, nullptr);
+                    if (entry) {
+                        CudaEngine::instance().downloadFlowToHost(*entry, gpuPairFlows[k], nullptr);
+                    }
+                }
+                for (uint64_t d : devTex) CudaEngine::instance().freeDevice(d);
+            }
+
+            // 1) Physical Exposure parity
+            {
+                RenderParams p;
+                p.width = pw; p.height = ph;
+                p.mode = eModeLongExposureTrail;
+                p.flowEngine = eFlowCudaPyramidal;
+                p.trailFrames = 5;
+                p.subFrameSteps = 6;
+                p.trailBlendMode = eTrailPhysicalExposure;
+                p.highlightBoost = 1.5f;
+
+                std::vector<float> gpuOut(static_cast<size_t>(pw) * ph * 4, 0.0f);
+                std::vector<float> cpuOut(static_cast<size_t>(pw) * ph * 4, 0.0f);
+                FlowCache gCache, cCache;
+                bool gOk = CudaEngine::instance().renderHostFrames(&p, fInputs, nFrames - 1, gpuOut.data(), p, gCache);
+                bool cOk = CpuFallbackProcessor::renderFrame(&p, fInputs, nFrames - 1, cpuOut.data(), p, cCache);
+                auto refOut = evalScalarTrailReference(p, gpuPairFlows);
+                refDiffPhys = evalMeanDiff(gpuOut, refOut, 16);
+                cpuDiffPhys = evalMeanDiff(gpuOut, cpuOut, 16);
+                parityOk &= gOk && cOk && (refDiffPhys < 0.002) && (cpuDiffPhys < 0.05);
+            }
+
+            // 2) Comet Decay + Rear-Curtain Crispness parity
+            {
+                RenderParams p;
+                p.width = pw; p.height = ph;
+                p.mode = eModeLongExposureTrail;
+                p.flowEngine = eFlowCudaPyramidal;
+                p.trailFrames = 5;
+                p.subFrameSteps = 6;
+                p.trailBlendMode = eTrailCometDecay;
+                p.trailDecay = 0.5f;
+                p.rearCurtainCrispness = 0.3f;
+                p.highlightBoost = 1.5f;
+
+                std::vector<float> gpuOut(static_cast<size_t>(pw) * ph * 4, 0.0f);
+                std::vector<float> cpuOut(static_cast<size_t>(pw) * ph * 4, 0.0f);
+                FlowCache gCache, cCache;
+                bool gOk = CudaEngine::instance().renderHostFrames(&p, fInputs, nFrames - 1, gpuOut.data(), p, gCache);
+                bool cOk = CpuFallbackProcessor::renderFrame(&p, fInputs, nFrames - 1, cpuOut.data(), p, cCache);
+                auto refOut = evalScalarTrailReference(p, gpuPairFlows);
+                refDiffComet = evalMeanDiff(gpuOut, refOut, 16);
+                cpuDiffComet = evalMeanDiff(gpuOut, cpuOut, 16);
+                parityOk &= gOk && cOk && (refDiffComet < 0.002) && (cpuDiffComet < 0.05);
+            }
+
+            // 3) Combined mode must not pollute raw TrailSplatCache for subsequent frame
+            {
+                FlowCache sharedCache, cleanCache;
+                const int tag = 909;
+                RenderParams pComb;
+                pComb.width = pw; pComb.height = ph;
+                pComb.mode = eModeCombined;
+                pComb.flowEngine = eFlowCudaPyramidal;
+                pComb.trailFrames = 3;
+                pComb.subFrameSteps = 4;
+                pComb.shutterAngle = 360.0f;
+                pComb.shutterSamples = 16;
+
+                std::vector<float> tmpOut(static_cast<size_t>(pw) * ph * 4);
+                std::vector<float> sharedTrailOut(static_cast<size_t>(pw) * ph * 4);
+                std::vector<float> cleanTrailOut(static_cast<size_t>(pw) * ph * 4);
+
+                // Frame 2 in Combined (splats shutter-blurred frame 2 over (2,1) and raw (1,0))
+                std::vector<FrameInput> winComb = {fInputs[0], fInputs[1], fInputs[2], fInputs[3]};
+                bool ok1 = CudaEngine::instance().renderHostFrames(&tag, winComb, 2, tmpOut.data(), pComb, sharedCache);
+
+                // Frame 3 in pure Long-Exposure Trail (uses pair (3,2) and pair (2,1)!)
+                RenderParams pTrail = pComb;
+                pTrail.mode = eModeLongExposureTrail;
+                std::vector<FrameInput> winTrail = {fInputs[1], fInputs[2], fInputs[3]};
+                bool ok2 = CudaEngine::instance().renderHostFrames(&tag, winTrail, 2, sharedTrailOut.data(), pTrail, sharedCache);
+                bool ok3 = CudaEngine::instance().renderHostFrames(&tag, winTrail, 2, cleanTrailOut.data(), pTrail, cleanCache);
+
+                combinedPolluteDiff = evalMeanDiff(sharedTrailOut, cleanTrailOut, 0);
+                parityOk &= ok1 && ok2 && ok3 && (combinedPolluteDiff < 1e-4);
+            }
+        }
+
+        // 4) Diagonal > 40 px jump Light-Painting (triggers global fallback path boxArea > 1536)
+        {
+            const int lw = 384, lh = 256;
+            const int numLightFrames = 5;
+            const float startX = 64.0f, startY = 48.0f;
+            const float stepX = 34.0f, stepY = 30.0f; // ~45.3 px diagonal jump -> boxArea > 1536
+            std::vector<std::vector<float>> lSeq(numLightFrames);
+            std::vector<FrameInput> lFrames(numLightFrames);
+            for (int i = 0; i < numLightFrames; ++i) {
+                lSeq[i] = makePointLightFrame(lw, lh, startX + i * stepX, startY + i * stepY, 6.0f, 1.0f);
+                lFrames[i] = {i, lSeq[i].data(), 0, nullptr, 0, 0};
+            }
+
+            RenderParams lp;
+            lp.width = lw; lp.height = lh;
+            lp.mode = eModeLongExposureTrail;
+            lp.flowEngine = eFlowCudaPyramidal;
+            lp.trailFrames = 5;
+            lp.subFrameSteps = 8;
+            lp.trailBlendMode = eTrailLightPainting;
+            lp.motionThreshold = 1.0f;
+            lp.lumaThreshold = 0.15f;
+
+            FlowCache lCache;
+            std::vector<float> lOut(static_cast<size_t>(lw) * lh * 4, 0.0f);
+            bool lOk = CudaEngine::instance().renderHostFrames(&lp, lFrames, numLightFrames - 1, lOut.data(), lp, lCache);
+
+            diagFallbackMinR = 10.0f;
+            for (int i = 0; i < numLightFrames - 1; ++i) {
+                int mx = static_cast<int>(std::lround(startX + (i + 0.5f) * stepX));
+                int my = static_cast<int>(std::lround(startY + (i + 0.5f) * stepY));
+                diagFallbackMinR = std::min(diagFallbackMinR, lOut[(static_cast<size_t>(my) * lw + mx) * 4 + 0]);
+            }
+            diagFallbackBg = lOut[(20 * lw + 340) * 4 + 0];
+            parityOk &= lOk && (diagFallbackMinR > 0.45f) && (diagFallbackBg <= 0.03f);
+        }
+
+        // 5) Sequential Accumulation Cache persistence across frames
+        {
+            const int sw = 256, sh = 128;
+            std::vector<std::vector<float>> sSeq(4);
+            for (int i = 0; i < 4; ++i) {
+                sSeq[i] = makePointLightFrame(sw, sh, 40.0f + i * 32.0f, 64.0f, 6.0f, 1.0f);
+            }
+            RenderParams sp;
+            sp.width = sw; sp.height = sh;
+            sp.mode = eModeLongExposureTrail;
+            sp.flowEngine = eFlowCudaPyramidal;
+            sp.trailFrames = 2; // lookback = 1 pair -> frame 0 is outside frame 2's window without sequentialCache!
+            sp.subFrameSteps = 6;
+            sp.trailBlendMode = eTrailLightPainting;
+            sp.trailDecay = 0.2f;
+            sp.sequentialCache = true;
+
+            FlowCache sCache;
+            const int seqTag = 515;
+            std::vector<float> sOut(static_cast<size_t>(sw) * sh * 4, 0.0f);
+            bool okS = true;
+            for (int f = 1; f <= 3; ++f) {
+                std::vector<FrameInput> win = {
+                    {f - 1, sSeq[f - 1].data(), 0, nullptr, 0, 0},
+                    {f, sSeq[f].data(), 0, nullptr, 0, 0}
+                };
+                okS &= CudaEngine::instance().renderHostFrames(&seqTag, win, 1, sOut.data(), sp, sCache);
+            }
+            // Light peak from frame 0 at x=40, y=64 must persist into frame 3 via sequentialCache!
+            seqPersistR = sOut[(64 * sw + 40) * 4 + 0];
+            parityOk &= okS && (seqPersistR > 0.35f);
+        }
+
+        // 9B: 1080p & 4K Long-Exposure Performance & 4K trailFrames=16 Cache Non-Thrashing
+        auto benchLongExposure = [](int w, int h, int trailLen, double& outColdMs, double& outWarmMs, double& outHitPct) -> bool {
+            const int numFrames = trailLen + 1; // frames 0..trailLen -> frame trailLen-1 (cold) then trailLen (warm)
+            const size_t rgbaBytes = static_cast<size_t>(w) * h * 4 * sizeof(float);
+            std::vector<uint64_t> devFrames(numFrames, 0);
+            for (int i = 0; i < numFrames; ++i) {
+                auto hostImg = makeTranslatedTextureFrame(w, h, i * 14.0f, -3.0f * i);
+                devFrames[i] = CudaEngine::instance().allocDevice(rgbaBytes);
+                if (!devFrames[i]) {
+                    for (uint64_t ptr : devFrames) CudaEngine::instance().freeDevice(ptr);
+                    return false;
+                }
+                CudaEngine::instance().uploadToDevice(devFrames[i], hostImg.data(), rgbaBytes);
+            }
+            uint64_t devOut = CudaEngine::instance().allocDevice(rgbaBytes);
+            if (!devOut) {
+                for (uint64_t ptr : devFrames) CudaEngine::instance().freeDevice(ptr);
+                return false;
+            }
+            CudaEngine::instance().syncStream(nullptr);
+
+            RenderParams p;
+            p.width = w; p.height = h;
+            p.mode = eModeLongExposureTrail;
+            p.flowEngine = eFlowNeural;
+            p.trailFrames = trailLen;
+            p.subFrameSteps = 8;
+            p.trailBlendMode = eTrailPhysicalExposure;
+
+            FlowCache& cache = FlowCache::global();
+            const int inst = 888;
+
+            // Warmup (2 iterations) to prime scratch pool and GPU boost clocks
+            for (int wi = 0; wi < 2; ++wi) {
+                std::vector<FrameInput> win = {
+                    {0, nullptr, devFrames[0], 0, 0, 0},
+                    {1, nullptr, devFrames[1], 0, 0, 0}
+                };
+                CudaEngine::instance().renderFrame(&inst, win, 1, devOut, p, cache, nullptr);
+                CudaEngine::instance().syncStream(nullptr);
+            }
+            cache.clear();
+            cache.resetStats();
+
+            // Cold render at frame (trailLen - 1) using frames [0 .. trailLen - 1]
+            std::vector<FrameInput> coldWin;
+            coldWin.reserve(trailLen);
+            for (int i = 0; i < trailLen; ++i) {
+                coldWin.push_back({i, nullptr, devFrames[i], 0, 0, 0});
+            }
+            auto t0 = std::chrono::steady_clock::now();
+            bool okCold = CudaEngine::instance().renderFrame(&inst, coldWin, trailLen - 1, devOut, p, cache, nullptr);
+            CudaEngine::instance().syncStream(nullptr);
+            auto t1 = std::chrono::steady_clock::now();
+            outColdMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            // Warm sequential frame at frame (trailLen) using frames [1 .. trailLen]
+            cache.resetStats();
+            std::vector<FrameInput> warmWin;
+            warmWin.reserve(trailLen);
+            for (int i = 1; i <= trailLen; ++i) {
+                warmWin.push_back({i, nullptr, devFrames[i], 0, 0, 0});
+            }
+            auto t2 = std::chrono::steady_clock::now();
+            bool okWarm = CudaEngine::instance().renderFrame(&inst, warmWin, trailLen - 1, devOut, p, cache, nullptr);
+            CudaEngine::instance().syncStream(nullptr);
+            auto t3 = std::chrono::steady_clock::now();
+            outWarmMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+            uint64_t hts = cache.hits(), mxs = cache.misses();
+            outHitPct = (hts + mxs > 0) ? (100.0 * hts / (hts + mxs)) : 0.0;
+
+            cache.clear();
+            CudaEngine::instance().freeDevice(devOut);
+            for (uint64_t ptr : devFrames) CudaEngine::instance().freeDevice(ptr);
+            return okCold && okWarm;
+        };
+
+        double cold1080_8 = 0, warm1080_8 = 0, hit1080_8 = 0;
+        double cold4K_8 = 0, warm4K_8 = 0, hit4K_8 = 0;
+        double cold4K_16 = 0, warm4K_16 = 0, hit4K_16 = 0;
+
+        bool b1080_8 = benchLongExposure(1920, 1080, 8, cold1080_8, warm1080_8, hit1080_8);
+        bool b4K_8 = benchLongExposure(3840, 2160, 8, cold4K_8, warm4K_8, hit4K_8);
+        bool b4K_16 = benchLongExposure(3840, 2160, 16, cold4K_16, warm4K_16, hit4K_16);
+
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "Parity(RefPhys=%.5f, RefComet=%.5f, CpuPhys=%.4f, CpuComet=%.4f, DiagMinR=%.3f, SeqR=%.3f, CombDiff=%.1e) | "
+                      "1080p8=%.1fms (cold=%.1fms, %.0f fps, hit=%.0f%%) | "
+                      "4K8=%.1fms (cold=%.1fms, %.1f fps, hit=%.0f%%) | "
+                      "4K16=%.1fms (cold=%.1fms, %.1f fps, hit=%.0f%%)",
+                      refDiffPhys, refDiffComet, cpuDiffPhys, cpuDiffComet,
+                      diagFallbackMinR, seqPersistR, combinedPolluteDiff,
+                      warm1080_8, cold1080_8, warm1080_8 > 0 ? 1000.0 / warm1080_8 : 0.0, hit1080_8,
+                      warm4K_8, cold4K_8, warm4K_8 > 0 ? 1000.0 / warm4K_8 : 0.0, hit4K_8,
+                      warm4K_16, cold4K_16, warm4K_16 > 0 ? 1000.0 / warm4K_16 : 0.0, hit4K_16);
+        report("Test 9: Long-Exposure Parity, 4K Non-Thrashing & Performance",
+               parityOk && b1080_8 && b4K_8 && b4K_16 &&
+               hit1080_8 >= 85.0 && hit4K_8 >= 85.0 && hit4K_16 >= 85.0,
+               buf);
+    }
+
+    // Test 10: Tile-Adaptive Auto Shutter Samples (GPU & CPU Parity)
+    {
+        const int aw = 256, ah = 128;
+        std::vector<std::vector<float>> seq(3, std::vector<float>(static_cast<size_t>(aw) * ah * 4, 0.12f));
+        for (int f = 0; f < 3; ++f) {
+            for (int y = 0; y < ah; ++y) {
+                for (int x = 0; x < aw; ++x) {
+                    size_t idx = (static_cast<size_t>(y) * aw + x) * 4;
+                    float r = 0.12f, g = 0.12f, b = 0.12f;
+                    // Slow-moving bar (~2 px/frame) in left-middle region
+                    float slowX = 48.0f + f * 2.0f;
+                    if (y >= 32 && y < 64 && std::abs(x - slowX) <= 6.0f) {
+                        r = 0.70f; g = 0.45f; b = 0.20f;
+                    }
+                    // Fast-moving bar (~24 px/frame) in right-middle region
+                    float fastX = 140.0f + f * 24.0f;
+                    if (y >= 64 && y < 96 && std::abs(x - fastX) <= 8.0f) {
+                        r = 0.90f; g = 0.85f; b = 0.30f;
+                    }
+                    seq[f][idx + 0] = r;
+                    seq[f][idx + 1] = g;
+                    seq[f][idx + 2] = b;
+                    seq[f][idx + 3] = 1.0f;
+                }
+            }
+        }
+
+        std::vector<FrameInput> win = {
+            {0, seq[0].data(), 0, nullptr, 0, 0},
+            {1, seq[1].data(), 0, nullptr, 0, 0},
+            {2, seq[2].data(), 0, nullptr, 0, 0}
+        };
+
+        RenderParams pAuto;
+        pAuto.width = aw; pAuto.height = ah;
+        pAuto.mode = eModeShutterBlur;
+        pAuto.flowEngine = eFlowCudaPyramidal;
+        pAuto.shutterAngle = 180.0f;
+        pAuto.autoShutterSamples = true;
+        pAuto.shutterSamples = 48;
+
+        RenderParams pFixed = pAuto;
+        pFixed.autoShutterSamples = false;
+
+        RenderParams pComb = pAuto;
+        pComb.mode = eModeCombined;
+        pComb.trailFrames = 3;
+
+        FlowCache gpuCache, cpuCache;
+        const int instId = 909;
+        std::vector<float> gpuAutoOut(seq[1].size(), 0.0f);
+        std::vector<float> cpuAutoOut(seq[1].size(), 0.0f);
+        std::vector<float> gpuFixedOut(seq[1].size(), 0.0f);
+        std::vector<float> gpuCombOut(seq[1].size(), 0.0f);
+
+        bool okGpuAuto = CudaEngine::instance().renderHostFrames(&instId, win, 1, gpuAutoOut.data(), pAuto, gpuCache);
+        bool okCpuAuto = CpuFallbackProcessor::renderFrame(&instId, win, 1, cpuAutoOut.data(), pAuto, cpuCache);
+        bool okGpuFixed = CudaEngine::instance().renderHostFrames(&instId, win, 1, gpuFixedOut.data(), pFixed, gpuCache);
+        bool okGpuComb = CudaEngine::instance().renderHostFrames(&instId, win, 1, gpuCombOut.data(), pComb, gpuCache);
+
+        bool finiteOk = true;
+        float staticMaxDiff = 0.0f;
+        float gpuCpuDiffSum = 0.0f;
+        for (size_t i = 0; i < gpuAutoOut.size(); ++i) {
+            if (!std::isfinite(gpuAutoOut[i]) || !std::isfinite(cpuAutoOut[i]) ||
+                !std::isfinite(gpuFixedOut[i]) || !std::isfinite(gpuCombOut[i])) {
+                finiteOk = false;
+                break;
+            }
+            gpuCpuDiffSum += std::abs(gpuAutoOut[i] - cpuAutoOut[i]);
+        }
+        // Top-left static corner (x < 24, y < 24) must remain untouched
+        for (int y = 0; y < 24; ++y) {
+            for (int x = 0; x < 24; ++x) {
+                size_t idx = (static_cast<size_t>(y) * aw + x) * 4;
+                for (int c = 0; c < 4; ++c) {
+                    staticMaxDiff = std::max(staticMaxDiff, std::abs(gpuAutoOut[idx + c] - seq[1][idx + c]));
+                }
+            }
+        }
+        float gpuCpuMeanDiff = gpuCpuDiffSum / static_cast<float>(gpuAutoOut.size());
+
+        char t10Buf[256];
+        std::snprintf(t10Buf, sizeof(t10Buf),
+                      "StaticDiff=%.2e, GpuCpuMeanDiff=%.4f, AutoOk=%d, FixedOk=%d, CombOk=%d",
+                      staticMaxDiff, gpuCpuMeanDiff, okGpuAuto && okCpuAuto ? 1 : 0,
+                      okGpuFixed ? 1 : 0, okGpuComb ? 1 : 0);
+        report("Test 10: Tile-Adaptive Auto Shutter Samples (GPU & CPU Parity)",
+               okGpuAuto && okCpuAuto && okGpuFixed && okGpuComb && finiteOk &&
+               staticMaxDiff < 1e-4f && gpuCpuMeanDiff < 0.05f,
+               t10Buf);
     }
 
     // Test 7: Graceful Shutdown & Re-init Cycle

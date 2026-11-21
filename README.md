@@ -1,26 +1,55 @@
-<!-- doc-type: product-features -->
-# BetterMotionBlur (OpenFX 1.4)
+# BetterMotionBlur
 
-GPU-accelerated OpenFX plugin (`BetterMotionBlur.ofx.bundle`) for **DaVinci Resolve** on Windows, built for:
-1. **Natural Shutter Blur** on high-shutter-speed footage (curved quadratic sub-frame integration, Tile-Max / Neighbor-Max dilation, matte foreground isolation).
-2. **Gapless Long-Exposure Motion Trails** on standard-shutter clips (flow-bridged sub-frame splatting, Physical Exposure, Light-Painting, and Comet/Rear-Curtain modes).
-3. **Native DaVinci Wide Gamut / DaVinci Intermediate (DW/I)** linear-light color pipeline.
+A GPU-accelerated OpenFX 1.4 plugin (`BetterMotionBlur.ofx.bundle`) for **DaVinci Resolve** on Windows. It synthesizes natural shutter motion blur on high-shutter-speed footage and gapless long-exposure motion trails on standard video, operating natively in **DaVinci Wide Gamut / DaVinci Intermediate (DW/I)**.
 
-## Project Documentation (`docs/`)
-- [00 — Project Intent & Overview](docs/00-Project-Intent-and-Overview.md) — Core goals, design decisions, architecture, build & install.
-- [01 — OFX Plugin & Parameters](docs/01-OFX-Plugin-and-Parameters.md) — OFX 1.4 contexts, temporal frame requests, parameter table, CPU/GPU dispatch.
-- [02 — Optical Flow & Caching](docs/02-Optical-Flow-and-Caching.md) — Pyramidal PatchMatch+LK, Neural proxy refinement (embedded GPU & external ONNX), canonical bidirectional LRU cache, and stream-keyed scratch pool.
-- [03 — Blur, Trails, Color & Diagnostics](docs/03-Blur-Trail-Color-and-Diagnostics.md) — Shutter blur synthesis, flow-bridged trail splatting, DW/I transfer math, and diagnostic views.
-- [04 — Lifecycle, Performance & Testing](docs/04-Lifecycle-Performance-and-Testing.md) — Windows DLL/CUDA/ORT unload safety, NVRTC compilation, and automated verification (`BetterMotionBlurTests.exe`).
-- [CHANGELOG.md](CHANGELOG.md) — Unreleased and pushed release history.
+## Techniques Used
 
-## Quick Build & Test (Windows)
+- **Bidirectional Optical Flow & Caching**
+  - Coarse-to-fine pyramidal **PatchMatch + Lucas-Kanade** (`eFlowCudaPyramidal`) and **Neural Proxy Flow** (`eFlowNeural`) with 4K joint-bilateral guided upsampling.
+  - Canonical bidirectional FP16 flow caching (`FlowCache`) and stream-keyed GPU scratch buffer pooling to avoid redundant flow computation during sequential playback.
+- **Natural Shutter Blur (`0°–720°`)**
+  - Quadratic curved sub-frame trajectory integration using `16×16` Tile-Max and `3×3` Neighbor-Max velocity dilation, with tile-adaptive sample scaling (`Auto Shutter Samples`) so fast foreground edges blur smoothly over static backgrounds.
+  - Optional matte-based foreground isolation to prevent foreground/background color bleeding.
+- **Gapless Long-Exposure Motion Trails (`2–24` frames)**
+  - Flow-bridged sub-frame splatting across consecutive frame pairs via 2-pass tile-aware shared-memory CUDA kernels.
+  - Supports **Physical Exposure (Linear)**, **Light-Painting (Max/Screen)** with motion/luma gating, **Comet / Rear-Curtain Decay**, and an optional **Sequential Accumulation Cache**.
+- **Native DW/I Linear-Light Color Pipeline**
+  - Decodes DaVinci Intermediate to scene-linear DaVinci Wide Gamut for physically accurate energy-conserving blur, highlight streak boosting, and trail compositing before re-encoding to DW/I.
+- **Runtime NVRTC & Built-in Diagnostics**
+  - Compiles embedded CUDA C kernels at runtime via NVRTC (no offline `nvcc` required) with a multithreaded CPU fallback when CUDA is unavailable.
+  - Includes diagnostic views (`Motion Vectors HSV`, `Occlusion Confidence`, `Trail Motion/Luma Mask`) for tuning edge preservation, thresholds, and mattes.
+
+## Requirements
+
+- **Operating System:** Windows 10 / 11 (64-bit)
+- **Host Software:** DaVinci Resolve (OpenFX 1.4 compatible host)
+- **GPU (Recommended):** NVIDIA GPU (Compute Capability 7.5+ / Turing or newer) with up-to-date NVIDIA drivers (`nvcuda.dll`) and NVRTC (`nvrtc64_120_0.dll`, included with DaVinci Resolve or CUDA Toolkit 12.x). A CPU fallback is used automatically if CUDA is unavailable.
+- **Optional External Neural Model:** `onnxruntime.dll` (provided by DaVinci Resolve) when using a custom external `neuflow_v2.onnx` model; otherwise, the built-in GPU-native residual refinement kernel is used.
+- **Building from Source (Optional):** CMake `>= 3.20`, MSVC with C++17 (x64), and the OpenFX 1.4 SDK.
+
+## Download
+
+1. Go to the [Releases](https://github.com/dont-panic-guide/better-motion-blur/releases/latest) page.
+2. Under **Assets**, download `BetterMotionBlur-Windows-x64.zip`.
+
+## Installation
+
+1. Extract `BetterMotionBlur-Windows-x64.zip`.
+2. Copy the `BetterMotionBlur.ofx.bundle` folder to:
+   ```text
+   C:\Program Files\Common Files\OFX\Plugins\
+   ```
+3. Restart DaVinci Resolve. The plugin will appear under **OpenFX** as **Better Motion Blur**.
+
+## Building from Source
+
 ```powershell
-& "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -B build -G "Visual Studio 18 2026" -A x64
-& "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" --build build --config Release
-.\build\Release\BetterMotionBlurTests.exe
+cmake -B build -A x64
+cmake --build build --config Release
 ```
 
-## Install in DaVinci Resolve
-Copy `build\Release\BetterMotionBlur.ofx.bundle` to:
-`C:\Program Files\Common Files\OFX\Plugins\BetterMotionBlur.ofx.bundle`
+If the OpenFX 1.4 SDK is not in the default DaVinci Resolve developer directory, pass `-DOFX_SDK_ROOT=<path-to-openfx-sdk>` during the configure step.
+
+## License
+
+Released under the **GNU General Public License v3.0 or later** (`GPL-3.0-or-later`). See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.

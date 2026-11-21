@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch OpenFX 1.4 SDK
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$env:RUNNER_TEMP/openfx"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/ofx_sdk/OpenFX-1.4" | Out-Null
+          Copy-Item -Recurse "$env:RUNNER_TEMP/openfx/include" "$env:RUNNER_TEMP/ofx_sdk/OpenFX-1.4/include"
+          Copy-Item -Recurse "$env:RUNNER_TEMP/openfx/Support" "$env:RUNNER_TEMP/ofx_sdk/Support"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 -DOFX_SDK_ROOT="$env:RUNNER_TEMP/ofx_sdk"
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build --config Release
+
+      - name: Package Release Bundle
+        shell: pwsh
+        run: |
+          $stageDir = "$env:RUNNER_TEMP/release_pkg"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item -Recurse "build/Release/BetterMotionBlur.ofx.bundle" "$stageDir/BetterMotionBlur.ofx.bundle"
+          Copy-Item "LICENSE" "$stageDir/LICENSE"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$stageDir/THIRD_PARTY_NOTICES.md"
+          Compress-Archive -Path "$stageDir/*" -DestinationPath "BetterMotionBlur-Windows-x64.zip" -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterMotionBlur-Windows-x64
+          path: BetterMotionBlur-Windows-x64.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BetterMotionBlur-Windows-x64.zip
+          generate_release_notes: true

@@ -40,6 +40,7 @@ using FnCuModuleUnload = CUresult(__stdcall*)(CUmodule hmod);
 using FnCuModuleGetFunction = CUresult(__stdcall*)(CUfunction* hfunc, CUmodule hmod, const char* name);
 using FnCuMemAlloc = CUresult(__stdcall*)(CUdeviceptr* dptr, size_t bytesize);
 using FnCuMemFree = CUresult(__stdcall*)(CUdeviceptr dptr);
+using FnCuMemGetInfo = CUresult(__stdcall*)(size_t* freeBytes, size_t* totalBytes);
 using FnCuMemcpyHtoDAsync = CUresult(__stdcall*)(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream hStream);
 using FnCuMemcpyDtoHAsync = CUresult(__stdcall*)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
 using FnCuMemcpyDtoDAsync = CUresult(__stdcall*)(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
@@ -78,6 +79,7 @@ struct CudaDriverTable {
     FnCuModuleGetFunction cuModuleGetFunction = nullptr;
     FnCuMemAlloc cuMemAlloc = nullptr;
     FnCuMemFree cuMemFree = nullptr;
+    FnCuMemGetInfo cuMemGetInfo = nullptr;
     FnCuMemcpyHtoDAsync cuMemcpyHtoDAsync = nullptr;
     FnCuMemcpyDtoHAsync cuMemcpyDtoHAsync = nullptr;
     FnCuMemcpyDtoDAsync cuMemcpyDtoDAsync = nullptr;
@@ -198,24 +200,46 @@ __device__ __forceinline__ float2 sampleFloat2_Bilinear(const float2* img, int w
                        v00.y * w00 + v10.y * w10 + v01.y * w01 + v11.y * w11);
 }
 
-__device__ __forceinline__ float2 readFlowVec(const float4* f4, int idx, int rev) {
-    float4 v = __ldg(&f4[idx]);
-    return rev ? make_float2(v.z, v.w) : make_float2(v.x, v.y);
+__device__ __forceinline__ unsigned int packHalf2(float a, float b) {
+    unsigned short h0, h1;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h0) : "f"(a));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h1) : "f"(b));
+    return (unsigned int)h0 | ((unsigned int)h1 << 16);
 }
 
-__device__ __forceinline__ float readConfVal(const float2* c2, int idx, int rev) {
-    float2 v = __ldg(&c2[idx]);
-    return rev ? v.y : v.x;
+__device__ __forceinline__ float2 unpackHalf2(unsigned int v) {
+    unsigned short h0 = (unsigned short)(v & 0xFFFFu);
+    unsigned short h1 = (unsigned short)(v >> 16);
+    float a, b;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(h0));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(b) : "h"(h1));
+    return make_float2(a, b);
 }
 
-__device__ __forceinline__ void atomicMaxFloat(float* addr, float val) {
-    int* addr_as_i = (int*)addr;
-    int old = *addr_as_i;
-    int assumed;
-    while (__int_as_float(old) < val) {
-        assumed = old;
-        old = atomicCAS(addr_as_i, assumed, __float_as_int(val));
-        if (assumed == old) break;
+__device__ __forceinline__ float2 readFlowVec(const uint2* f4, int idx, int rev) {
+    uint2 v = __ldg(&f4[idx]);
+    return unpackHalf2(rev ? v.y : v.x);
+}
+
+__device__ __forceinline__ float readConfVal(const uchar2* c2, int idx, int rev) {
+    uchar2 v = __ldg(&c2[idx]);
+    return (float)(rev ? v.y : v.x) * (1.0f / 255.0f);
+}
+
+__device__ __forceinline__ float readMatteVal(const float* matte, int idx, int matteComp) {
+    if (!matte || matteComp <= 0) return 1.0f;
+    if (matteComp == 1) {
+        return clampf(__ldg(&matte[idx]), 0.0f, 1.0f);
+    }
+    const float4* matte4 = (const float4*)matte;
+    float4 m = __ldg(&matte4[idx]);
+    float mv = (m.w > 0.0f && m.w < 0.9999f) ? m.w : (0.2126f * m.x + 0.7152f * m.y + 0.0722f * m.z);
+    return clampf(mv, 0.0f, 1.0f);
+}
+
+__device__ __forceinline__ void atomicMaxPosFloat(float* addr, float val) {
+    if (val > 0.0f) {
+        atomicMax((int*)addr, __float_as_int(val));
     }
 }
 
@@ -759,7 +783,7 @@ __global__ void jointBilateralUpsampleKernel(
 __global__ void packBidirectionalKernel(
     int w, int h,
     const float2* fwdFlow, const float2* bwdFlow,
-    float4* outFlow4, float2* outConf2)
+    uint2* outFlow4, uchar2* outConf2)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -779,15 +803,17 @@ __global__ void packBidirectionalKernel(
     float errBY = bLocal.y + fAtDest.y;
     float confBwd = expf(-(errBX * errBX + errBY * errBY) * 0.25f);
 
-    outFlow4[idx] = make_float4(f.x, f.y, bLocal.x, bLocal.y);
-    outConf2[idx] = make_float2(confFwd, confBwd);
+    outFlow4[idx] = make_uint2(packHalf2(f.x, f.y), packHalf2(bLocal.x, bLocal.y));
+    unsigned char cF = (unsigned char)(clampf(confFwd, 0.0f, 1.0f) * 255.0f + 0.5f);
+    unsigned char cB = (unsigned char)(clampf(confBwd, 0.0f, 1.0f) * 255.0f + 0.5f);
+    outConf2[idx] = make_uchar2(cF, cB);
 }
 
 // Coalesced 16x16 block-per-tile shared-memory parallel reduction
 __global__ void tileMaxVelKernel(
     int w, int h, int tileW, int tileH, int tileSize,
-    const float4* flowFwd, int fwdRev,
-    const float4* flowBwd, int bwdRev,
+    const uint2* flowFwd, int fwdRev,
+    const uint2* flowBwd, int bwdRev,
     float sensitivity, float threshold,
     float2* tileMax)
 {
@@ -863,13 +889,13 @@ __global__ void neighborMaxVelKernel(
 __global__ void synthesizeShutterBlurKernel(
     int w, int h, int tileW, int tileH, int tileSize,
     const float* srcRGBA,
-    const float4* flowFwd, int fwdRev, // (t->t+1)
-    const float4* flowBwd, int bwdRev, // (t->t-1)
-    const float2* conf2,
+    const uint2* flowFwd, int fwdRev, // (t->t+1)
+    const uint2* flowBwd, int bwdRev, // (t->t-1)
+    const uchar2* conf2,
     const float2* neighborMax,
     const float* matteTex,
     int hasMatte, int matteMode,
-    float shutterAngle, float shutterPhase, int samples,
+    float shutterAngle, float shutterPhase, int samples, int autoSamples,
     float sensitivity, float threshold,
     float highlightBoost,
     float* dstRGBA)
@@ -932,10 +958,16 @@ __global__ void synthesizeShutterBlurKernel(
     float fgCenter = (hasMatte && matteMode == 1) ? mCenter : (centerSpeed > 0.35f * domSpeed ? 1.0f : 0.0f);
     const bool useDom = (domSpeed > centerSpeed + 0.75f) && (fgCenter < 0.5f);
     const bool matteIso = (hasMatte && matteMode == 1);
-    const float invSamples = 1.0f / (float)samples;
+    int effSamples = samples;
+    if (autoSamples) {
+        int minS = min(samples, 8);
+        int adaptive = (int)ceilf(domSpeed * shutterSpan * 1.25f);
+        effSamples = clampi(adaptive, minS, samples);
+    }
+    const float invSamples = 1.0f / (float)effSamples;
     const float jOffset = 0.5f + 0.35f * jitter;
 
-    for (int i = 0; i < samples; ++i) {
+    for (int i = 0; i < effSamples; ++i) {
         float u = ((float)i + jOffset) * invSamples;
         float tau = phaseCenter + (u - 0.5f) * shutterSpan;
 
@@ -995,8 +1027,14 @@ __global__ void synthesizeShutterBlurKernel(
         pix.y = dwiToLinearChannel(pix.y);
         pix.z = dwiToLinearChannel(pix.z);
 
-        float luma = dwgLuminance(pix.x, pix.y, pix.z);
-        float hdrW = 1.0f + highlightBoost * powf(fmaxf(0.0f, luma - 0.8f), 1.5f);
+        float hdrW = 1.0f;
+        if (highlightBoost > 0.0f) {
+            float luma = dwgLuminance(pix.x, pix.y, pix.z);
+            if (luma > 0.8f) {
+                float ex = luma - 0.8f;
+                hdrW += highlightBoost * ex * sqrtf(ex);
+            }
+        }
         float totW = wSample * hdrW;
 
         accumRGB.x += totW * pix.x;
@@ -1028,204 +1066,629 @@ __global__ void synthesizeShutterBlurKernel(
     dst4[idx] = make_float4(outRGB.x, outRGB.y, outRGB.z, outA);
 }
 
-__global__ void zeroFloatBufferKernel(int count, float* buf) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) buf[idx] = 0.0f;
-}
+struct TrailPairBatch {
+    unsigned long long ptrs[24];
+    float scales[24];
+    int count;
+    int pad;
+};
 
-__global__ void trailBaseInitKernel(
-    int w, int h, const float* currRGBA, int blendMode, float* accumRGBW)
+__device__ __forceinline__ void flushCellCorner(
+    int ox, int oy, int w, int h, int blendMode,
+    int useShared, int blockMinX, int blockMinY, int boxW, int boxH,
+    float* sR, float* sG, float* sB, float* sW, float* dstAccum,
+    float cr, float cg, float cb, float cw)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-
-    int idx = y * w + x;
-    const float4* cur4 = (const float4*)currRGBA;
-    float4* acc4 = (float4*)accumRGBW;
-    float4 p = __ldg(&cur4[idx]);
-    float r = dwiToLinearChannel(p.x);
-    float g = dwiToLinearChannel(p.y);
-    float b = dwiToLinearChannel(p.z);
-
+    if (ox < 0 || ox >= w || oy < 0 || oy >= h) return;
     if (blendMode == 1) {
-        acc4[idx] = make_float4(r, g, b, 1.0f);
+        if (cr <= 0.0f && cg <= 0.0f && cb <= 0.0f) return;
+        if (useShared) {
+            int lx = ox - blockMinX;
+            int ly = oy - blockMinY;
+            if ((unsigned int)lx < (unsigned int)boxW && (unsigned int)ly < (unsigned int)boxH) {
+                int sidx = ly * boxW + lx;
+                atomicMaxPosFloat(&sR[sidx], cr);
+                atomicMaxPosFloat(&sG[sidx], cg);
+                atomicMaxPosFloat(&sB[sidx], cb);
+            }
+        } else {
+            int gidx = (oy * w + ox) * 4;
+            atomicMaxPosFloat(&dstAccum[gidx + 0], cr);
+            atomicMaxPosFloat(&dstAccum[gidx + 1], cg);
+            atomicMaxPosFloat(&dstAccum[gidx + 2], cb);
+        }
     } else {
-        acc4[idx] = make_float4(r * 0.02f, g * 0.02f, b * 0.02f, 0.02f);
+        if (cw <= 0.0f) return;
+        if (useShared) {
+            int lx = ox - blockMinX;
+            int ly = oy - blockMinY;
+            if ((unsigned int)lx < (unsigned int)boxW && (unsigned int)ly < (unsigned int)boxH) {
+                int sidx = ly * boxW + lx;
+                atomicAdd(&sR[sidx], cr);
+                atomicAdd(&sG[sidx], cg);
+                atomicAdd(&sB[sidx], cb);
+                atomicAdd(&sW[sidx], cw);
+            }
+        } else {
+            int gidx = (oy * w + ox) * 4;
+            atomicAdd(&dstAccum[gidx + 0], cr);
+            atomicAdd(&dstAccum[gidx + 1], cg);
+            atomicAdd(&dstAccum[gidx + 2], cb);
+            atomicAdd(&dstAccum[gidx + 3], cw);
+        }
     }
 }
 
-__global__ void trailSplatSubFrameKernel(
+__device__ __forceinline__ void flushCell4(
+    int cx, int cy, int w, int h, int blendMode,
+    int useShared, int blockMinX, int blockMinY, int boxW, int boxH,
+    float* sR, float* sG, float* sB, float* sW, float* dstAccum,
+    float c00r, float c00g, float c00b, float c00w,
+    float c10r, float c10g, float c10b, float c10w,
+    float c01r, float c01g, float c01b, float c01w,
+    float c11r, float c11g, float c11b, float c11w)
+{
+    flushCellCorner(cx,     cy,     w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH, sR, sG, sB, sW, dstAccum, c00r, c00g, c00b, c00w);
+    flushCellCorner(cx + 1, cy,     w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH, sR, sG, sB, sW, dstAccum, c10r, c10g, c10b, c10w);
+    flushCellCorner(cx,     cy + 1, w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH, sR, sG, sB, sW, dstAccum, c01r, c01g, c01b, c01w);
+    flushCellCorner(cx + 1, cy + 1, w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH, sR, sG, sB, sW, dstAccum, c11r, c11g, c11b, c11w);
+}
+
+__global__ void trailPairInitStaticKernel(
+    int w, int h,
+    const float* frameA,
+    const uint2* flow4, int flowRev,
+    const float* matteA, int matteAComp, int hasMatte, int matteMode,
+    int pairAgeIndex, int subFrameSteps,
+    int blendMode, float trailDecay,
+    float sensitivity, float motionThreshold, float lumaThreshold,
+    float highlightBoost, int addToExisting,
+    float4* pairAccum, unsigned char* tileActive)
+{
+    int x = (int)blockIdx.x * 16 + (int)threadIdx.x;
+    int y = (int)blockIdx.y * 16 + (int)threadIdx.y;
+
+    bool isMoving = false;
+
+    if (x < w && y < h) {
+        int idx = y * w + x;
+        float mVal = (hasMatte && matteMode == 2 && matteA && matteAComp > 0)
+                         ? readMatteVal(matteA, idx, matteAComp)
+                         : 1.0f;
+
+        if (hasMatte && matteMode == 2 && mVal <= 0.001f) {
+            if (blendMode != 1) {
+                const float4* frameA4 = (const float4*)frameA;
+                float4 pA = __ldg(&frameA4[idx]);
+                float rA = dwiToLinearChannel(pA.x);
+                float gA = dwiToLinearChannel(pA.y);
+                float bA = dwiToLinearChannel(pA.z);
+                float decayLambda = 0.25f + 3.2f * trailDecay;
+                float wBase = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+                if (addToExisting) {
+                    float4 curAcc = pairAccum[idx];
+                    curAcc.x += rA * wBase;
+                    curAcc.y += gA * wBase;
+                    curAcc.z += bA * wBase;
+                    curAcc.w += wBase;
+                    pairAccum[idx] = curAcc;
+                } else {
+                    pairAccum[idx] = make_float4(rA * wBase, gA * wBase, bA * wBase, wBase);
+                }
+            } else if (!addToExisting) {
+                pairAccum[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        } else {
+            float speed = 0.0f;
+            if (flow4 && (subFrameSteps > 1 || (blendMode == 1 && motionThreshold > 0.0f))) {
+                float2 fl = readFlowVec(flow4, idx, flowRev);
+                speed = hypotf(fl.x * sensitivity, fl.y * sensitivity);
+            }
+
+            float motionGate = 1.0f;
+            if (blendMode == 1 && motionThreshold > 0.0f) {
+                motionGate = smoothstepf(motionThreshold, motionThreshold + 0.75f, speed);
+            }
+
+            if (blendMode == 1 && motionGate <= 0.01f) {
+                if (!addToExisting) {
+                    pairAccum[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            } else {
+                const float4* frameA4 = (const float4*)frameA;
+                float4 pA = __ldg(&frameA4[idx]);
+                float rA = dwiToLinearChannel(pA.x);
+                float gA = dwiToLinearChannel(pA.y);
+                float bA = dwiToLinearChannel(pA.z);
+
+                float lumaGate = 1.0f;
+                if (blendMode == 1 && lumaThreshold > 0.0f) {
+                    float luma = dwgLuminance(rA, gA, bA);
+                    float lumaDwi = linearToDwiChannel(luma);
+                    lumaGate = smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi);
+                }
+
+                if (blendMode == 1 && motionGate * lumaGate <= 0.01f) {
+                    if (!addToExisting) {
+                        pairAccum[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                } else if (subFrameSteps <= 1 || speed < 0.35f) {
+                    float decayLambda = 0.25f + 3.2f * trailDecay;
+                    float timeW = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+                    if (blendMode == 1) {
+                        float gate = motionGate * lumaGate * timeW;
+                        float vr = fmaxf(0.0f, rA * gate);
+                        float vg = fmaxf(0.0f, gA * gate);
+                        float vb = fmaxf(0.0f, bA * gate);
+                        if (addToExisting) {
+                            float4 curAcc = pairAccum[idx];
+                            curAcc.x = fmaxf(curAcc.x, vr);
+                            curAcc.y = fmaxf(curAcc.y, vg);
+                            curAcc.z = fmaxf(curAcc.z, vb);
+                            pairAccum[idx] = curAcc;
+                        } else {
+                            pairAccum[idx] = make_float4(vr, vg, vb, 0.0f);
+                        }
+                    } else {
+                        float hdrW = 1.0f;
+                        if (highlightBoost > 0.0f) {
+                            float luma = dwgLuminance(rA, gA, bA);
+                            if (luma > 0.8f) {
+                                float ex = luma - 0.8f;
+                                hdrW += highlightBoost * ex * sqrtf(ex);
+                            }
+                        }
+                        float wTot = timeW * hdrW;
+                        if (addToExisting) {
+                            float4 curAcc = pairAccum[idx];
+                            curAcc.x += rA * wTot;
+                            curAcc.y += gA * wTot;
+                            curAcc.z += bA * wTot;
+                            curAcc.w += wTot;
+                            pairAccum[idx] = curAcc;
+                        } else {
+                            pairAccum[idx] = make_float4(rA * wTot, gA * wTot, bA * wTot, wTot);
+                        }
+                    }
+                } else {
+                    isMoving = true;
+                    if (!addToExisting) {
+                        pairAccum[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                }
+            }
+        }
+    }
+
+    int anyMoving = __syncthreads_or(isMoving ? 1 : 0);
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        tileActive[blockIdx.y * gridDim.x + blockIdx.x] = anyMoving ? 1 : 0;
+    }
+}
+
+__global__ void trailPairSplatMovingKernel(
     int w, int h,
     const float* frameA, const float* frameB,
-    const float4* flow4, const float2* conf2, int flowRev,
-    const float* matteA, int hasMatte, int matteMode,
-    int pairAgeIndex, int subFrameSteps, int hasFrameB,
+    const uint2* flow4, const uchar2* conf2, int flowRev,
+    const float* matteA, int matteAComp, int hasMatte, int matteMode,
+    int pairAgeIndex, int subFrameSteps,
     int blendMode, float trailDecay,
     float sensitivity, float motionThreshold, float lumaThreshold,
     float highlightBoost,
-    float* accumRGBW)
+    const unsigned char* tileActive,
+    float* dstAccum)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+    int blockId = (int)blockIdx.y * (int)gridDim.x + (int)blockIdx.x;
+    if (!tileActive[blockId]) return;
 
-    int idx = y * w + x;
-    const float4* frameA4 = (const float4*)frameA;
-    float4 pA = __ldg(&frameA4[idx]);
-    float rA = dwiToLinearChannel(pA.x);
-    float gA = dwiToLinearChannel(pA.y);
-    float bA = dwiToLinearChannel(pA.z);
+    __shared__ float sR[1536];
+    __shared__ float sG[1536];
+    __shared__ float sB[1536];
+    __shared__ float sW[1536];
+    __shared__ int sMinX[8];
+    __shared__ int sMaxX[8];
+    __shared__ int sMinY[8];
+    __shared__ int sMaxY[8];
+    __shared__ int sBbox[4];
 
-    float2 fl = flow4 ? readFlowVec(flow4, idx, flowRev) : make_float2(0.0f, 0.0f);
-    float vx = fl.x * sensitivity;
-    float vy = fl.y * sensitivity;
-    float speed = hypotf(vx, vy);
+    const int tid = (int)threadIdx.y * 16 + (int)threadIdx.x;
+    const int x = (int)blockIdx.x * 16 + (int)threadIdx.x;
+    const int y = (int)blockIdx.y * 16 + (int)threadIdx.y;
+    const int idx = y * w + x;
 
-    float mVal = (hasMatte && matteA) ? __ldg(&matteA[idx]) : 1.0f;
-    if (hasMatte && matteMode == 2 && mVal <= 0.001f) {
-        if (blendMode != 1) {
-            float decayLambda = 0.2f + 2.8f * trailDecay;
-            float wBase = (blendMode == 2) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
-            atomicAdd(&accumRGBW[idx * 4 + 0], rA * wBase);
-            atomicAdd(&accumRGBW[idx * 4 + 1], gA * wBase);
-            atomicAdd(&accumRGBW[idx * 4 + 2], bA * wBase);
-            atomicAdd(&accumRGBW[idx * 4 + 3], wBase);
-        }
-        return;
-    }
+    bool isActive = false;
+    float2 fl = make_float2(0.0f, 0.0f);
+    float vx = 0.0f, vy = 0.0f, speed = 0.0f;
+    float rA = 0.0f, gA = 0.0f, bA = 0.0f;
+    float motionGate = 1.0f, lumaGate = 1.0f;
+    int adaptiveSteps = 0;
 
-    float luma = dwgLuminance(rA, gA, bA);
-    float lumaDwi = linearToDwiChannel(luma);
-    float motionGate = (motionThreshold > 0.0f) ? smoothstepf(motionThreshold, motionThreshold + 0.75f, speed) : 1.0f;
-    float lumaGate = (lumaThreshold > 0.0f) ? smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi) : 1.0f;
-
-    // Early reject gated-out pixels in Light-Painting mode before sampling frameB or splatting
-    if (blendMode == 1 && motionGate * lumaGate <= 0.01f) {
-        return;
-    }
-
-    float decayLambda = 0.25f + 3.2f * trailDecay;
-    float hdrW = 1.0f + highlightBoost * powf(fmaxf(0.0f, luma - 0.8f), 1.5f);
-
-    if (subFrameSteps <= 1 || !hasFrameB || speed < 0.35f) {
-        float age = (float)pairAgeIndex;
-        float timeW = (blendMode == 2) ? expf(-decayLambda * age) : 1.0f;
-        if (blendMode == 1) {
-            float gate = motionGate * lumaGate * timeW;
-            if (gate > 0.01f) {
-                atomicMaxFloat(&accumRGBW[idx * 4 + 0], rA * gate);
-                atomicMaxFloat(&accumRGBW[idx * 4 + 1], gA * gate);
-                atomicMaxFloat(&accumRGBW[idx * 4 + 2], bA * gate);
-            }
-        } else {
-            float wTot = timeW * hdrW;
-            atomicAdd(&accumRGBW[idx * 4 + 0], rA * wTot);
-            atomicAdd(&accumRGBW[idx * 4 + 1], gA * wTot);
-            atomicAdd(&accumRGBW[idx * 4 + 2], bA * wTot);
-            atomicAdd(&accumRGBW[idx * 4 + 3], wTot);
-        }
-        return;
-    }
-
-    int adaptiveSteps = max(subFrameSteps, min(72, (int)ceilf(speed * 1.25f)));
-    float invSteps = 1.0f / (float)adaptiveSteps;
-
-    float4 pB = sampleRGBA_Bilinear(frameB, w, h, (float)x + fl.x, (float)y + fl.y);
-    pB.x = dwiToLinearChannel(pB.x);
-    pB.y = dwiToLinearChannel(pB.y);
-    pB.z = dwiToLinearChannel(pB.z);
-    float conf = conf2 ? readConfVal(conf2, idx, flowRev) : 1.0f;
-
-    for (int s = 0; s < adaptiveSteps; ++s) {
-        float alpha = (float)s * invSteps;
-        float px = (float)x + alpha * vx;
-        float py = (float)y + alpha * vy;
-
-        float blendB = alpha * conf;
-        float sr = rA * (1.0f - blendB) + pB.x * blendB;
-        float sg = gA * (1.0f - blendB) + pB.y * blendB;
-        float sb = bA * (1.0f - blendB) + pB.z * blendB;
-
-        float age = (float)pairAgeIndex + alpha;
-        float timeW = (blendMode == 2) ? expf(-decayLambda * age) : 1.0f;
-
-        int x0 = (int)floorf(px);
-        int y0 = (int)floorf(py);
-        float fx = px - (float)x0;
-        float fy = py - (float)y0;
-
-        float bw[4] = {
-            (1.0f - fx) * (1.0f - fy),
-            fx * (1.0f - fy),
-            (1.0f - fx) * fy,
-            fx * fy
-        };
-        int ox[4] = {x0, x0 + 1, x0, x0 + 1};
-        int oy[4] = {y0, y0, y0 + 1, y0 + 1};
-
-        if (blendMode == 1) {
-            float gate = motionGate * lumaGate * timeW;
-            if (gate <= 0.01f) continue;
-            for (int c = 0; c < 4; ++c) {
-                if (ox[c] >= 0 && ox[c] < w && oy[c] >= 0 && oy[c] < h && bw[c] > 0.01f) {
-                    int tidx = oy[c] * w + ox[c];
-                    float splatGain = fminf(1.0f, bw[c] * 1.35f) * gate;
-                    atomicMaxFloat(&accumRGBW[tidx * 4 + 0], sr * splatGain);
-                    atomicMaxFloat(&accumRGBW[tidx * 4 + 1], sg * splatGain);
-                    atomicMaxFloat(&accumRGBW[tidx * 4 + 2], sb * splatGain);
+    if (x < w && y < h && subFrameSteps > 1 && flow4) {
+        float mVal = (hasMatte && matteMode == 2 && matteA && matteAComp > 0)
+                         ? readMatteVal(matteA, idx, matteAComp)
+                         : 1.0f;
+        if (!(hasMatte && matteMode == 2 && mVal <= 0.001f)) {
+            fl = readFlowVec(flow4, idx, flowRev);
+            vx = fl.x * sensitivity;
+            vy = fl.y * sensitivity;
+            speed = hypotf(vx, vy);
+            if (speed >= 0.35f) {
+                if (blendMode == 1) {
+                    motionGate = (motionThreshold > 0.0f) ? smoothstepf(motionThreshold, motionThreshold + 0.75f, speed) : 1.0f;
+                    if (motionGate > 0.01f) {
+                        const float4* frameA4 = (const float4*)frameA;
+                        float4 pA = __ldg(&frameA4[idx]);
+                        rA = dwiToLinearChannel(pA.x);
+                        gA = dwiToLinearChannel(pA.y);
+                        bA = dwiToLinearChannel(pA.z);
+                        if (lumaThreshold > 0.0f) {
+                            float luma = dwgLuminance(rA, gA, bA);
+                            float lumaDwi = linearToDwiChannel(luma);
+                            lumaGate = smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi);
+                        }
+                        if (motionGate * lumaGate > 0.01f) {
+                            isActive = true;
+                        }
+                    }
+                } else {
+                    const float4* frameA4 = (const float4*)frameA;
+                    float4 pA = __ldg(&frameA4[idx]);
+                    rA = dwiToLinearChannel(pA.x);
+                    gA = dwiToLinearChannel(pA.y);
+                    bA = dwiToLinearChannel(pA.z);
+                    isActive = true;
                 }
             }
-        } else {
-            float wStep = timeW * hdrW * invSteps;
-            for (int c = 0; c < 4; ++c) {
-                if (bw[c] > 1e-4f && ox[c] >= 0 && ox[c] < w && oy[c] >= 0 && oy[c] < h) {
-                    int tidx = oy[c] * w + ox[c];
-                    float wt = wStep * bw[c];
-                    atomicAdd(&accumRGBW[tidx * 4 + 0], sr * wt);
-                    atomicAdd(&accumRGBW[tidx * 4 + 1], sg * wt);
-                    atomicAdd(&accumRGBW[tidx * 4 + 2], sb * wt);
-                    atomicAdd(&accumRGBW[tidx * 4 + 3], wt);
+        }
+    }
+
+    int txMin = w, txMax = -1, tyMin = h, tyMax = -1;
+    if (isActive) {
+        adaptiveSteps = max(subFrameSteps, min(72, (int)ceilf(speed * 1.25f)));
+        float invSteps = 1.0f / (float)adaptiveSteps;
+        float alphaEnd = (float)(adaptiveSteps - 1) * invSteps;
+        float endX = (float)x + alphaEnd * vx;
+        float endY = (float)y + alphaEnd * vy;
+        float minPx = fminf((float)x, endX) - 0.01f;
+        float maxPx = fmaxf((float)x, endX) + 0.01f;
+        float minPy = fminf((float)y, endY) - 0.01f;
+        float maxPy = fmaxf((float)y, endY) + 0.01f;
+        txMin = clampi((int)floorf(minPx), 0, w - 1);
+        txMax = clampi((int)floorf(maxPx) + 1, 0, w - 1);
+        tyMin = clampi((int)floorf(minPy), 0, h - 1);
+        tyMax = clampi((int)floorf(maxPy) + 1, 0, h - 1);
+    }
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        txMin = min(txMin, __shfl_down_sync(0xFFFFFFFFu, txMin, offset));
+        txMax = max(txMax, __shfl_down_sync(0xFFFFFFFFu, txMax, offset));
+        tyMin = min(tyMin, __shfl_down_sync(0xFFFFFFFFu, tyMin, offset));
+        tyMax = max(tyMax, __shfl_down_sync(0xFFFFFFFFu, tyMax, offset));
+    }
+    if (lane == 0) {
+        sMinX[warp] = txMin; sMaxX[warp] = txMax;
+        sMinY[warp] = tyMin; sMaxY[warp] = tyMax;
+    }
+    __syncthreads();
+
+    if (tid < 8) {
+        int vx0 = sMinX[tid], vx1 = sMaxX[tid], vy0 = sMinY[tid], vy1 = sMaxY[tid];
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            vx0 = min(vx0, __shfl_down_sync(0xFFu, vx0, offset));
+            vx1 = max(vx1, __shfl_down_sync(0xFFu, vx1, offset));
+            vy0 = min(vy0, __shfl_down_sync(0xFFu, vy0, offset));
+            vy1 = max(vy1, __shfl_down_sync(0xFFu, vy1, offset));
+        }
+        if (tid == 0) {
+            sBbox[0] = vx0; sBbox[1] = vx1; sBbox[2] = vy0; sBbox[3] = vy1;
+        }
+    }
+    __syncthreads();
+
+    const int blockMinX = sBbox[0], blockMaxX = sBbox[1];
+    const int blockMinY = sBbox[2], blockMaxY = sBbox[3];
+    if (blockMinX > blockMaxX || blockMinY > blockMaxY) return;
+
+    const int boxW = blockMaxX - blockMinX + 1;
+    const int boxH = blockMaxY - blockMinY + 1;
+    const int boxArea = boxW * boxH;
+    const int useShared = (boxArea <= 1536) ? 1 : 0;
+
+    if (useShared) {
+        for (int i = tid; i < boxArea; i += 256) {
+            sR[i] = 0.0f;
+            sG[i] = 0.0f;
+            sB[i] = 0.0f;
+            if (blendMode != 1) {
+                sW[i] = 0.0f;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (isActive) {
+        float4 pB = sampleRGBA_Bilinear(frameB, w, h, (float)x + fl.x, (float)y + fl.y);
+        pB.x = dwiToLinearChannel(pB.x);
+        pB.y = dwiToLinearChannel(pB.y);
+        pB.z = dwiToLinearChannel(pB.z);
+        float conf = conf2 ? readConfVal(conf2, idx, flowRev) : 1.0f;
+
+        float hdrW = 1.0f;
+        if (blendMode != 1 && highlightBoost > 0.0f) {
+            float luma = dwgLuminance(rA, gA, bA);
+            if (luma > 0.8f) {
+                float ex = luma - 0.8f;
+                hdrW += highlightBoost * ex * sqrtf(ex);
+            }
+        }
+
+        const float invSteps = 1.0f / (float)adaptiveSteps;
+        const float stepVx = vx * invSteps;
+        const float stepVy = vy * invSteps;
+        const float confStep = conf * invSteps;
+        const float dr = (pB.x - rA) * confStep;
+        const float dg = (pB.y - gA) * confStep;
+        const float db = (pB.z - bA) * confStep;
+
+        const float decayLambda = 0.25f + 3.2f * trailDecay;
+        float timeW = (blendMode == 2) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+        const float decayMul = (blendMode == 2) ? expf(-decayLambda * invSteps) : 1.0f;
+        const float baseGate = motionGate * lumaGate;
+
+        float px = (float)x, py = (float)y;
+        float sr = rA, sg = gA, sb = bA;
+
+        int curX0 = -2147483647, curY0 = -2147483647;
+        float c00r = 0.0f, c00g = 0.0f, c00b = 0.0f, c00w = 0.0f;
+        float c10r = 0.0f, c10g = 0.0f, c10b = 0.0f, c10w = 0.0f;
+        float c01r = 0.0f, c01g = 0.0f, c01b = 0.0f, c01w = 0.0f;
+        float c11r = 0.0f, c11g = 0.0f, c11b = 0.0f, c11w = 0.0f;
+
+        for (int s = 0; s < adaptiveSteps; ++s) {
+            int x0 = (int)floorf(px);
+            int y0 = (int)floorf(py);
+            if (x0 != curX0 || y0 != curY0) {
+                if (curX0 != -2147483647) {
+                    flushCell4(curX0, curY0, w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH,
+                               sR, sG, sB, sW, dstAccum,
+                               c00r, c00g, c00b, c00w, c10r, c10g, c10b, c10w,
+                               c01r, c01g, c01b, c01w, c11r, c11g, c11b, c11w);
+                }
+                curX0 = x0;
+                curY0 = y0;
+                c00r = c00g = c00b = c00w = 0.0f;
+                c10r = c10g = c10b = c10w = 0.0f;
+                c01r = c01g = c01b = c01w = 0.0f;
+                c11r = c11g = c11b = c11w = 0.0f;
+            }
+
+            float fx = px - (float)x0;
+            float fy = py - (float)y0;
+            float omfx = 1.0f - fx;
+            float omfy = 1.0f - fy;
+            float bw00 = omfx * omfy;
+            float bw10 = fx * omfy;
+            float bw01 = omfx * fy;
+            float bw11 = fx * fy;
+
+            if (blendMode == 1) {
+                float gate = baseGate * timeW;
+                if (gate > 0.01f) {
+                    float pr = fmaxf(0.0f, sr);
+                    float pg = fmaxf(0.0f, sg);
+                    float pb = fmaxf(0.0f, sb);
+                    if (bw00 > 0.01f) {
+                        float g00 = fminf(1.0f, bw00 * 1.35f) * gate;
+                        c00r = fmaxf(c00r, pr * g00); c00g = fmaxf(c00g, pg * g00); c00b = fmaxf(c00b, pb * g00);
+                    }
+                    if (bw10 > 0.01f) {
+                        float g10 = fminf(1.0f, bw10 * 1.35f) * gate;
+                        c10r = fmaxf(c10r, pr * g10); c10g = fmaxf(c10g, pg * g10); c10b = fmaxf(c10b, pb * g10);
+                    }
+                    if (bw01 > 0.01f) {
+                        float g01 = fminf(1.0f, bw01 * 1.35f) * gate;
+                        c01r = fmaxf(c01r, pr * g01); c01g = fmaxf(c01g, pg * g01); c01b = fmaxf(c01b, pb * g01);
+                    }
+                    if (bw11 > 0.01f) {
+                        float g11 = fminf(1.0f, bw11 * 1.35f) * gate;
+                        c11r = fmaxf(c11r, pr * g11); c11g = fmaxf(c11g, pg * g11); c11b = fmaxf(c11b, pb * g11);
+                    }
+                }
+            } else {
+                float wStep = timeW * hdrW * invSteps;
+                if (bw00 > 1e-4f) {
+                    float wt = wStep * bw00;
+                    c00r += sr * wt; c00g += sg * wt; c00b += sb * wt; c00w += wt;
+                }
+                if (bw10 > 1e-4f) {
+                    float wt = wStep * bw10;
+                    c10r += sr * wt; c10g += sg * wt; c10b += sb * wt; c10w += wt;
+                }
+                if (bw01 > 1e-4f) {
+                    float wt = wStep * bw01;
+                    c01r += sr * wt; c01g += sg * wt; c01b += sb * wt; c01w += wt;
+                }
+                if (bw11 > 1e-4f) {
+                    float wt = wStep * bw11;
+                    c11r += sr * wt; c11g += sg * wt; c11b += sb * wt; c11w += wt;
+                }
+            }
+
+            px += stepVx;
+            py += stepVy;
+            sr += dr;
+            sg += dg;
+            sb += db;
+            timeW *= decayMul;
+        }
+
+        if (curX0 != -2147483647) {
+            flushCell4(curX0, curY0, w, h, blendMode, useShared, blockMinX, blockMinY, boxW, boxH,
+                       sR, sG, sB, sW, dstAccum,
+                       c00r, c00g, c00b, c00w, c10r, c10g, c10b, c10w,
+                       c01r, c01g, c01b, c01w, c11r, c11g, c11b, c11w);
+        }
+    }
+
+    if (useShared) {
+        __syncthreads();
+        for (int i = tid; i < boxArea; i += 256) {
+            if (blendMode == 1) {
+                float vr = sR[i];
+                float vg = sG[i];
+                float vb = sB[i];
+                if (vr > 0.0f || vg > 0.0f || vb > 0.0f) {
+                    int ly = i / boxW;
+                    int lx = i - ly * boxW;
+                    int gidx = ((blockMinY + ly) * w + (blockMinX + lx)) * 4;
+                    atomicMaxPosFloat(&dstAccum[gidx + 0], vr);
+                    atomicMaxPosFloat(&dstAccum[gidx + 1], vg);
+                    atomicMaxPosFloat(&dstAccum[gidx + 2], vb);
+                }
+            } else {
+                float vw = sW[i];
+                if (vw > 0.0f) {
+                    int ly = i / boxW;
+                    int lx = i - ly * boxW;
+                    int gidx = ((blockMinY + ly) * w + (blockMinX + lx)) * 4;
+                    atomicAdd(&dstAccum[gidx + 0], sR[i]);
+                    atomicAdd(&dstAccum[gidx + 1], sG[i]);
+                    atomicAdd(&dstAccum[gidx + 2], sB[i]);
+                    atomicAdd(&dstAccum[gidx + 3], vw);
                 }
             }
         }
     }
 }
 
-__global__ void trailFinalizeKernel(
+__global__ void trailCompositeAndFinalizeKernel(
     int w, int h,
-    const float* currRGBA, const float* accumRGBW, const float* matteTex,
-    int hasMatte, int matteMode,
-    int blendMode, float rearCurtainCrispness,
+    const float* currRGBA, const float* currMatte, int currMatteComp,
+    const float* lastRGBA, const float* lastMatte, int lastMatteComp,
+    int hasLastFrame, float lastTimeW,
+    TrailPairBatch batch,
+    const float4* uncachedAccum, int hasUncached,
+    int hasMatte, int matteMode, int blendMode,
+    float motionThreshold, float lumaThreshold, float highlightBoost,
+    float rearCurtainCrispness,
+    float seqDecay, const float4* seqPrevLin, float4* seqOutLin,
     float* dstRGBA)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = (int)blockIdx.x * 16 + (int)threadIdx.x;
+    int y = (int)blockIdx.y * 16 + (int)threadIdx.y;
     if (x >= w || y >= h) return;
 
     int idx = y * w + x;
     const float4* cur4 = (const float4*)currRGBA;
-    const float4* acc4 = (const float4*)accumRGBW;
-    float4* dst4 = (float4*)dstRGBA;
-
     float4 cur = __ldg(&cur4[idx]);
-    float4 acc = acc4[idx];
-
     float cr = dwiToLinearChannel(cur.x);
     float cg = dwiToLinearChannel(cur.y);
     float cb = dwiToLinearChannel(cur.z);
 
+    float4 acc = (blendMode == 1)
+                     ? make_float4(cr, cg, cb, 1.0f)
+                     : make_float4(cr * 0.02f, cg * 0.02f, cb * 0.02f, 0.02f);
+
+    if (hasLastFrame && lastRGBA) {
+        float lastM = (hasMatte && matteMode == 2 && lastMatte && lastMatteComp > 0)
+                          ? readMatteVal(lastMatte, idx, lastMatteComp)
+                          : 1.0f;
+        if (hasMatte && matteMode == 2 && lastM <= 0.001f) {
+            if (blendMode != 1) {
+                const float4* last4 = (const float4*)lastRGBA;
+                float4 pL = __ldg(&last4[idx]);
+                acc.x += dwiToLinearChannel(pL.x) * lastTimeW;
+                acc.y += dwiToLinearChannel(pL.y) * lastTimeW;
+                acc.z += dwiToLinearChannel(pL.z) * lastTimeW;
+                acc.w += lastTimeW;
+            }
+        } else if (blendMode == 1) {
+            if (motionThreshold <= 0.0f) {
+                const float4* last4 = (const float4*)lastRGBA;
+                float4 pL = __ldg(&last4[idx]);
+                float lr = dwiToLinearChannel(pL.x);
+                float lg = dwiToLinearChannel(pL.y);
+                float lb = dwiToLinearChannel(pL.z);
+                float lumaGate = 1.0f;
+                if (lumaThreshold > 0.0f) {
+                    float luma = dwgLuminance(lr, lg, lb);
+                    float lumaDwi = linearToDwiChannel(luma);
+                    lumaGate = smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi);
+                }
+                if (lumaGate > 0.01f) {
+                    float vr = lr * lumaGate, vg = lg * lumaGate, vb = lb * lumaGate;
+                    if (vr > 0.0f) acc.x = fmaxf(acc.x, vr);
+                    if (vg > 0.0f) acc.y = fmaxf(acc.y, vg);
+                    if (vb > 0.0f) acc.z = fmaxf(acc.z, vb);
+                }
+            }
+        } else {
+            const float4* last4 = (const float4*)lastRGBA;
+            float4 pL = __ldg(&last4[idx]);
+            float lr = dwiToLinearChannel(pL.x);
+            float lg = dwiToLinearChannel(pL.y);
+            float lb = dwiToLinearChannel(pL.z);
+            float hdrW = 1.0f;
+            if (highlightBoost > 0.0f) {
+                float luma = dwgLuminance(lr, lg, lb);
+                if (luma > 0.8f) {
+                    float ex = luma - 0.8f;
+                    hdrW += highlightBoost * ex * sqrtf(ex);
+                }
+            }
+            float wTot = lastTimeW * hdrW;
+            acc.x += lr * wTot;
+            acc.y += lg * wTot;
+            acc.z += lb * wTot;
+            acc.w += wTot;
+        }
+    }
+
+    if (blendMode == 1) {
+        for (int i = 0; i < batch.count; ++i) {
+            const float4* pBuf = (const float4*)batch.ptrs[i];
+            float4 pv = __ldg(&pBuf[idx]);
+            if (pv.x > 0.0f) acc.x = fmaxf(acc.x, pv.x);
+            if (pv.y > 0.0f) acc.y = fmaxf(acc.y, pv.y);
+            if (pv.z > 0.0f) acc.z = fmaxf(acc.z, pv.z);
+        }
+        if (hasUncached && uncachedAccum) {
+            float4 uv = __ldg(&uncachedAccum[idx]);
+            if (uv.x > 0.0f) acc.x = fmaxf(acc.x, uv.x);
+            if (uv.y > 0.0f) acc.y = fmaxf(acc.y, uv.y);
+            if (uv.z > 0.0f) acc.z = fmaxf(acc.z, uv.z);
+        }
+    } else {
+        for (int i = 0; i < batch.count; ++i) {
+            const float4* pBuf = (const float4*)batch.ptrs[i];
+            float4 pv = __ldg(&pBuf[idx]);
+            float sc = batch.scales[i];
+            acc.x += pv.x * sc;
+            acc.y += pv.y * sc;
+            acc.z += pv.z * sc;
+            acc.w += pv.w * sc;
+        }
+        if (hasUncached && uncachedAccum) {
+            float4 uv = __ldg(&uncachedAccum[idx]);
+            acc.x += uv.x;
+            acc.y += uv.y;
+            acc.z += uv.z;
+            acc.w += uv.w;
+        }
+    }
+
     float or_, og_, ob_;
     if (blendMode == 1) {
-        or_ = fmaxf(cr, acc.x);
-        og_ = fmaxf(cg, acc.y);
-        ob_ = fmaxf(cb, acc.z);
+        or_ = acc.x;
+        og_ = acc.y;
+        ob_ = acc.z;
     } else {
-        float wSum = fmaxf(1e-5f, acc.w);
-        or_ = acc.x / wSum;
-        og_ = acc.y / wSum;
-        ob_ = acc.z / wSum;
-
+        float invW = 1.0f / fmaxf(1e-5f, acc.w);
+        or_ = acc.x * invW;
+        og_ = acc.y * invW;
+        ob_ = acc.z * invW;
         if (blendMode == 2 && rearCurtainCrispness > 0.0f) {
             float crisp = clampf(rearCurtainCrispness, 0.0f, 1.0f);
             or_ = or_ * (1.0f - crisp) + cr * crisp;
@@ -1234,53 +1697,43 @@ __global__ void trailFinalizeKernel(
         }
     }
 
-    or_ = linearToDwiChannel(or_);
-    og_ = linearToDwiChannel(og_);
-    ob_ = linearToDwiChannel(ob_);
-
-    if (hasMatte && matteMode == 2 && matteTex) {
-        float m = __ldg(&matteTex[idx]);
-        or_ = cur.x * (1.0f - m) + or_ * m;
-        og_ = cur.y * (1.0f - m) + og_ * m;
-        ob_ = cur.z * (1.0f - m) + ob_ * m;
-    }
-
-    dst4[idx] = make_float4(or_, og_, ob_, cur.w);
-}
-
-__global__ void applySeqFeedbackKernel(
-    int w, int h, float decay, int blendMode,
-    const float* prevAccum, float* currOut)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-
-    int idx = y * w + x;
-    float4* dst4 = (float4*)currOut;
-    const float4* prev4 = (const float4*)prevAccum;
-    float4 dstV = dst4[idx];
-    float4 prevV = __ldg(&prev4[idx]);
-
-    float k = clampf(1.0f - decay * 0.5f, 0.1f, 0.96f);
-    float dr = dwiToLinearChannel(dstV.x);
-    float dg = dwiToLinearChannel(dstV.y);
-    float db = dwiToLinearChannel(dstV.z);
-    float pr = dwiToLinearChannel(prevV.x);
-    float pg = dwiToLinearChannel(prevV.y);
-    float pb = dwiToLinearChannel(prevV.z);
-
-    if (blendMode == 1) {
-        dr = fmaxf(dr, pr * k);
-        dg = fmaxf(dg, pg * k);
-        db = fmaxf(db, pb * k);
+    float4* dst4 = (float4*)dstRGBA;
+    if (seqPrevLin || seqOutLin) {
+        if (hasMatte && matteMode == 2 && currMatte && currMatteComp > 0) {
+            float m = readMatteVal(currMatte, idx, currMatteComp);
+            or_ = cr * (1.0f - m) + or_ * m;
+            og_ = cg * (1.0f - m) + og_ * m;
+            ob_ = cb * (1.0f - m) + ob_ * m;
+        }
+        if (seqPrevLin) {
+            float4 prevV = seqPrevLin[idx];
+            if (blendMode == 1) {
+                or_ = fmaxf(or_, prevV.x * seqDecay);
+                og_ = fmaxf(og_, prevV.y * seqDecay);
+                ob_ = fmaxf(ob_, prevV.z * seqDecay);
+            } else {
+                float alpha = 1.0f - seqDecay * 0.65f;
+                or_ = prevV.x * (1.0f - alpha) + or_ * alpha;
+                og_ = prevV.y * (1.0f - alpha) + og_ * alpha;
+                ob_ = prevV.z * (1.0f - alpha) + ob_ * alpha;
+            }
+        }
+        if (seqOutLin) {
+            seqOutLin[idx] = make_float4(or_, og_, ob_, cur.w);
+        }
+        dst4[idx] = make_float4(linearToDwiChannel(or_), linearToDwiChannel(og_), linearToDwiChannel(ob_), cur.w);
     } else {
-        float alpha = 1.0f - k * 0.65f;
-        dr = pr * (1.0f - alpha) + dr * alpha;
-        dg = pg * (1.0f - alpha) + dg * alpha;
-        db = pb * (1.0f - alpha) + db * alpha;
+        float dwiR = linearToDwiChannel(or_);
+        float dwiG = linearToDwiChannel(og_);
+        float dwiB = linearToDwiChannel(ob_);
+        if (hasMatte && matteMode == 2 && currMatte && currMatteComp > 0) {
+            float m = readMatteVal(currMatte, idx, currMatteComp);
+            dwiR = cur.x * (1.0f - m) + dwiR * m;
+            dwiG = cur.y * (1.0f - m) + dwiG * m;
+            dwiB = cur.z * (1.0f - m) + dwiB * m;
+        }
+        dst4[idx] = make_float4(dwiR, dwiG, dwiB, cur.w);
     }
-    dst4[idx] = make_float4(linearToDwiChannel(dr), linearToDwiChannel(dg), linearToDwiChannel(db), dstV.w);
 }
 
 __device__ __forceinline__ void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
@@ -1299,7 +1752,7 @@ __device__ __forceinline__ void hsvToRgb(float h, float s, float v, float& r, fl
 
 __global__ void renderDiagnosticViewKernel(
     int w, int h, int viewMode,
-    const float* srcRGBA, const float4* flow4, const float2* conf2, int flowRev,
+    const float* srcRGBA, const uint2* flow4, const uchar2* conf2, int flowRev,
     const float* matteTex, int hasMatte,
     float sensitivity, float motionThresh, float lumaThresh,
     float* dstRGBA)
@@ -1395,6 +1848,7 @@ bool CudaEngine::initialize() {
     ok &= loadSym(cuMod, g_cu.cuModuleGetFunction, "cuModuleGetFunction");
     ok &= loadSym(cuMod, g_cu.cuMemAlloc, "cuMemAlloc_v2");
     ok &= loadSym(cuMod, g_cu.cuMemFree, "cuMemFree_v2");
+    loadSym(cuMod, g_cu.cuMemGetInfo, "cuMemGetInfo_v2");
     ok &= loadSym(cuMod, g_cu.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
     ok &= loadSym(cuMod, g_cu.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");
     ok &= loadSym(cuMod, g_cu.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
@@ -1447,6 +1901,16 @@ bool CudaEngine::initialize() {
     }
 
     m_initialized = true;
+
+    if (g_cu.cuMemGetInfo) {
+        size_t freeMem = 0, totalMem = 0;
+        if (g_cu.cuMemGetInfo(&freeMem, &totalMem) == CUDA_SUCCESS_VAL && totalMem > 0) {
+            constexpr size_t kMinBudget = 1536ULL * 1024ULL * 1024ULL;
+            constexpr size_t kMaxBudget = 5120ULL * 1024ULL * 1024ULL;
+            const size_t target = std::min(totalMem / 4, freeMem / 2);
+            FlowCache::global().setMaxBytes(std::clamp(target, kMinBudget, kMaxBudget));
+        }
+    }
     return true;
 }
 
@@ -1542,11 +2006,9 @@ bool CudaEngine::compileKernels() {
     ok &= (g_cu.cuModuleGetFunction(&m_fnTileMaxVel, m_module, "tileMaxVelKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnNeighborMaxVel, m_module, "neighborMaxVelKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnShutterBlur, m_module, "synthesizeShutterBlurKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnZeroFloatBuffer, m_module, "zeroFloatBufferKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailBaseInit, m_module, "trailBaseInitKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailSplatSubFrame, m_module, "trailSplatSubFrameKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailFinalize, m_module, "trailFinalizeKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnApplySeqFeedback, m_module, "applySeqFeedbackKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailPairInitStatic, m_module, "trailPairInitStaticKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailPairSplatMoving, m_module, "trailPairSplatMovingKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnTrailCompositeAndFinalize, m_module, "trailCompositeAndFinalizeKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnRenderDiagnostic, m_module, "renderDiagnosticViewKernel") == CUDA_SUCCESS_VAL);
 
     if (!ok) {
@@ -1885,13 +2347,95 @@ bool CudaEngine::launchFlowFromPyramids(
     return true;
 }
 
+namespace {
+
+struct TrailPairBatch {
+    uint64_t ptrs[24];
+    float scales[24];
+    int count;
+    int pad;
+};
+
+inline float halfToFloat(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+    uint32_t fBits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            fBits = sign;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            mant &= 0x03FFu;
+            fBits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        fBits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        fBits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &fBits, sizeof(out));
+    return out;
+}
+
+inline FlowCacheKey makeFlowCacheKey(
+    const void* instanceId, int fLow, int fHigh, const RenderParams& params)
+{
+    return FlowCacheKey{
+        instanceId,
+        fLow,
+        fHigh,
+        params.width,
+        params.height,
+        static_cast<int>(params.flowEngine),
+        static_cast<int>(std::lround(params.flowDetail * 20.0f)),
+        static_cast<int>(params.matteMode),
+        true
+    };
+}
+
+inline TrailSplatCacheKey makeTrailSplatCacheKey(
+    const void* instanceId, int frameA, int frameB, bool frameHasMatte, const RenderParams& params)
+{
+    const bool isLightPainting = (params.trailBlendMode == eTrailLightPainting);
+    const bool isComet = (params.trailBlendMode == eTrailCometDecay);
+    TrailSplatCacheKey key;
+    key.instanceId = instanceId;
+    key.frameA = frameA;
+    key.frameB = frameB;
+    key.width = params.width;
+    key.height = params.height;
+    key.flowEngine = static_cast<int>(params.flowEngine);
+    key.detailQuantized = static_cast<int>(std::lround(params.flowDetail * 20.0f));
+    key.matteMode = static_cast<int>(params.matteMode);
+    key.hasMatte = (params.matteMode != eMatteIgnore) && frameHasMatte;
+    key.blendMode = static_cast<int>(params.trailBlendMode);
+    key.subFrameSteps = params.subFrameSteps;
+    key.sensitivityQuantized = static_cast<int>(std::lround(params.motionSensitivity * 1000.0f));
+    key.motionThresholdQuantized = isLightPainting ? static_cast<int>(std::lround(params.motionThreshold * 1000.0f)) : 0;
+    key.lumaThresholdQuantized = isLightPainting ? static_cast<int>(std::lround(params.lumaThreshold * 1000.0f)) : 0;
+    key.trailDecayQuantized = isComet ? static_cast<int>(std::lround(params.trailDecay * 1000.0f)) : 0;
+    key.highlightBoostQuantized = !isLightPainting ? static_cast<int>(std::lround(params.highlightBoost * 1000.0f)) : 0;
+    return key;
+}
+
+} // namespace
+
 CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
     const void* instanceId,
     int frameAIndex, uint64_t devFrameA, uint64_t devMatteA, int matteAComp,
     int frameBIndex, uint64_t devFrameB, uint64_t devMatteB, int matteBComp,
     const RenderParams& params,
     FlowCache& cache,
-    void* stream)
+    void* stream,
+    PyramidSet* callerPyrA,
+    PyramidSet* callerPyrB,
+    bool skipCacheLookup)
 {
     const bool reversed = (frameAIndex > frameBIndex);
     int fLow = reversed ? frameBIndex : frameAIndex;
@@ -1903,23 +2447,18 @@ CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
     int lowMatteComp = reversed ? matteBComp : matteAComp;
     int highMatteComp = reversed ? matteAComp : matteBComp;
 
-    FlowCacheKey key{
-        instanceId,
-        fLow,
-        fHigh,
-        params.width,
-        params.height,
-        static_cast<int>(params.flowEngine),
-        static_cast<int>(std::lround(params.flowDetail * 20.0f)),
-        true
-    };
+    FlowCacheKey key = makeFlowCacheKey(instanceId, fLow, fHigh, params);
 
-    if (auto cached = cache.get(key)) {
-        return {cached, reversed};
+    if (!skipCacheLookup) {
+        if (auto cached = cache.get(key)) {
+            return {cached, reversed};
+        }
     }
 
     const size_t nPix = static_cast<size_t>(params.width) * params.height;
     const size_t flow2Bytes = nPix * sizeof(Float2);
+    const size_t flow4Bytes = nPix * 2 * sizeof(uint32_t); // uint2 (4x fp16)
+    const size_t conf2Bytes = nPix * 2;                    // uchar2
     uint64_t devFwd2 = acquireScratch(flow2Bytes, stream);
     uint64_t devBwd2 = acquireScratch(flow2Bytes, stream);
 
@@ -1927,10 +2466,14 @@ CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
     entry->width = params.width;
     entry->height = params.height;
     entry->isGpu = true;
-    entry->devFlow4 = allocDevice(nPix * sizeof(Float4));
-    entry->devConf2 = allocDevice(nPix * sizeof(Float2));
-    entry->byteSize = nPix * (sizeof(Float4) + sizeof(Float2));
-    entry->gpuFreeFn = [this](uint64_t ptr) { this->freeDevice(ptr); };
+    entry->isHalfFlow = true;
+    entry->devFlow4 = acquireScratch(flow4Bytes, stream);
+    entry->devConf2 = acquireScratch(conf2Bytes, stream);
+    entry->byteSize = flow4Bytes + conf2Bytes;
+    const uint64_t fPtr = entry->devFlow4;
+    entry->gpuFreeFn = [this, fPtr, flow4Bytes, conf2Bytes, stream](uint64_t ptr) {
+        this->releaseScratch(ptr, (ptr == fPtr) ? flow4Bytes : conf2Bytes, stream);
+    };
 
     if (!devFwd2 || !devBwd2 || !entry->devFlow4 || !entry->devConf2) {
         releaseScratch(devFwd2, flow2Bytes, stream);
@@ -1939,25 +2482,41 @@ CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
     }
 
     const bool needMatte = (params.matteMode == eMatteForegroundIsolation);
-    PyramidSet pyrLow, pyrHigh;
-    if (!buildPyramid(devLowRGBA, devLowMatte, lowMatteComp, needMatte, params.width, params.height, pyrLow, stream) ||
-        !buildPyramid(devHighRGBA, devHighMatte, highMatteComp, needMatte, params.width, params.height, pyrHigh, stream)) {
-        releasePyramid(pyrLow, stream);
-        releasePyramid(pyrHigh, stream);
-        releaseScratch(devFwd2, flow2Bytes, stream);
-        releaseScratch(devBwd2, flow2Bytes, stream);
-        return {nullptr, reversed};
+    PyramidSet* callerPyrLow = reversed ? callerPyrB : callerPyrA;
+    PyramidSet* callerPyrHigh = reversed ? callerPyrA : callerPyrB;
+
+    PyramidSet localPyrLow, localPyrHigh;
+    PyramidSet* usePyrLow = callerPyrLow ? callerPyrLow : &localPyrLow;
+    PyramidSet* usePyrHigh = callerPyrHigh ? callerPyrHigh : &localPyrHigh;
+
+    if (usePyrLow->numLevels == 0) {
+        if (!buildPyramid(devLowRGBA, devLowMatte, lowMatteComp, needMatte, params.width, params.height, *usePyrLow, stream)) {
+            releasePyramid(localPyrLow, stream);
+            releasePyramid(localPyrHigh, stream);
+            releaseScratch(devFwd2, flow2Bytes, stream);
+            releaseScratch(devBwd2, flow2Bytes, stream);
+            return {nullptr, reversed};
+        }
+    }
+    if (usePyrHigh->numLevels == 0) {
+        if (!buildPyramid(devHighRGBA, devHighMatte, highMatteComp, needMatte, params.width, params.height, *usePyrHigh, stream)) {
+            releasePyramid(localPyrLow, stream);
+            releasePyramid(localPyrHigh, stream);
+            releaseScratch(devFwd2, flow2Bytes, stream);
+            releaseScratch(devBwd2, flow2Bytes, stream);
+            return {nullptr, reversed};
+        }
     }
 
-    bool ok1 = launchFlowFromPyramids(pyrLow, pyrHigh, params.width, params.height,
+    bool ok1 = launchFlowFromPyramids(*usePyrLow, *usePyrHigh, params.width, params.height,
                                        params.flowEngine, params.flowDetail, params.matteMode,
                                        devFwd2, stream);
-    bool ok2 = ok1 && launchFlowFromPyramids(pyrHigh, pyrLow, params.width, params.height,
+    bool ok2 = ok1 && launchFlowFromPyramids(*usePyrHigh, *usePyrLow, params.width, params.height,
                                               params.flowEngine, params.flowDetail, params.matteMode,
                                               devBwd2, stream);
 
-    releasePyramid(pyrLow, stream);
-    releasePyramid(pyrHigh, stream);
+    releasePyramid(localPyrLow, stream);
+    releasePyramid(localPyrHigh, stream);
 
     if (!ok1 || !ok2) {
         releaseScratch(devFwd2, flow2Bytes, stream);
@@ -1978,6 +2537,33 @@ CudaEngine::FlowPairResult CudaEngine::getOrComputeFlowPairCanonical(
 
     cache.put(key, entry);
     return {entry, reversed};
+}
+
+bool CudaEngine::downloadFlowToHost(const FlowEntry& entry, std::vector<Float4>& outHostFlow, void* stream) {
+    if (!entry.isGpu) {
+        outHostFlow = entry.hostFlow4;
+        return !outHostFlow.empty();
+    }
+    if (!initialize() || !entry.devFlow4 || entry.width <= 0 || entry.height <= 0) return false;
+    const size_t nPix = static_cast<size_t>(entry.width) * entry.height;
+    outHostFlow.resize(nPix);
+    if (entry.isHalfFlow) {
+        std::vector<uint32_t> packed(nPix * 2);
+        if (!downloadFromDevice(packed.data(), entry.devFlow4, nPix * 2 * sizeof(uint32_t), stream)) return false;
+        if (!syncStream(stream)) return false;
+        for (size_t i = 0; i < nPix; ++i) {
+            uint32_t p0 = packed[i * 2 + 0];
+            uint32_t p1 = packed[i * 2 + 1];
+            outHostFlow[i].x = halfToFloat(static_cast<uint16_t>(p0 & 0xFFFFu));
+            outHostFlow[i].y = halfToFloat(static_cast<uint16_t>(p0 >> 16));
+            outHostFlow[i].z = halfToFloat(static_cast<uint16_t>(p1 & 0xFFFFu));
+            outHostFlow[i].w = halfToFloat(static_cast<uint16_t>(p1 >> 16));
+        }
+    } else {
+        if (!downloadFromDevice(outHostFlow.data(), entry.devFlow4, nPix * sizeof(Float4), stream)) return false;
+        if (!syncStream(stream)) return false;
+    }
+    return true;
 }
 
 std::shared_ptr<FlowEntry> CudaEngine::getOrComputeFlowPair(
@@ -2017,11 +2603,15 @@ bool CudaEngine::renderFrame(
     unsigned int gx = 0, gy = 0;
     grid2D(w, h, bx, by, gx, gy);
 
-    // Extract single-channel matte for current frame if available
+    // Extract single-channel matte only when needed by Diagnostic View or Shutter Blur
     uint64_t devCurrMatte = 0;
     const size_t floatBufBytes = nPix * sizeof(float);
     int hasMatte = (curr.deviceMatte != 0 && curr.matteComponents > 0 && params.matteMode != eMatteIgnore) ? 1 : 0;
-    if (hasMatte) {
+    const bool needsCurrMatteTex = (hasMatte != 0) &&
+                                   ((params.viewMode != eViewFinal) ||
+                                    (params.mode == eModeShutterBlur) ||
+                                    (params.mode == eModeCombined));
+    if (needsCurrMatteTex) {
         devCurrMatte = acquireScratch(floatBufBytes, stream);
         uint64_t tmpLuma = acquireScratch(floatBufBytes, stream);
         int comp = curr.matteComponents;
@@ -2040,13 +2630,14 @@ bool CudaEngine::renderFrame(
                                  (params.mode == eModeCombined);
 
     if (needsCenterFlow) {
+        PyramidSet pyrCurr;
         if (centerIdx + 1 < static_cast<int>(frames.size())) {
             const auto& nextF = frames[centerIdx + 1];
             flowFwdRes = getOrComputeFlowPairCanonical(
                 instanceId,
                 curr.frameIndex, curr.deviceRGBA, curr.deviceMatte, curr.matteComponents,
                 nextF.frameIndex, nextF.deviceRGBA, nextF.deviceMatte, nextF.matteComponents,
-                params, cache, stream);
+                params, cache, stream, &pyrCurr, nullptr);
         }
         if (centerIdx - 1 >= 0) {
             const auto& prevF = frames[centerIdx - 1];
@@ -2054,8 +2645,9 @@ bool CudaEngine::renderFrame(
                 instanceId,
                 curr.frameIndex, curr.deviceRGBA, curr.deviceMatte, curr.matteComponents,
                 prevF.frameIndex, prevF.deviceRGBA, prevF.deviceMatte, prevF.matteComponents,
-                params, cache, stream);
+                params, cache, stream, &pyrCurr, nullptr);
         }
+        releasePyramid(pyrCurr, stream);
     }
 
     // Diagnostic views
@@ -2121,6 +2713,7 @@ bool CudaEngine::renderFrame(
         float sAngle = params.shutterAngle;
         float sPhase = params.shutterPhase;
         int sSamples = params.shutterSamples;
+        int autoSamples = params.autoShutterSamples ? 1 : 0;
         float hBoost = params.highlightBoost;
 
         void* pBlur[] = {const_cast<int*>(&w), const_cast<int*>(&h),
@@ -2128,7 +2721,7 @@ bool CudaEngine::renderFrame(
                          const_cast<uint64_t*>(&curr.deviceRGBA),
                          &f4Fwd, &fwdRev, &f4Bwd, &bwdRev, &c2Ptr, &devNeighborMax,
                          &devCurrMatte, &hasMatte, &mMode,
-                         &sAngle, &sPhase, &sSamples,
+                         &sAngle, &sPhase, &sSamples, &autoSamples,
                          &sens, &mt, &hBoost,
                          &targetBuf};
         g_cu.cuLaunchKernel(m_fnShutterBlur, gx, gy, 1, bx, by, 1, 0, stream, pBlur, nullptr);
@@ -2144,17 +2737,8 @@ bool CudaEngine::renderFrame(
     }
 
     // Pass 2: Long-Exposure Motion Trail (eModeLongExposureTrail or eModeCombined)
-    uint64_t devAccum = acquireScratch(rgbaBytes, stream);
-    int totalFloats = static_cast<int>(nPix * 4);
-    unsigned int zBlocks = static_cast<unsigned int>((totalFloats + 255) / 256);
-    void* pZero[] = {&totalFloats, &devAccum};
-    g_cu.cuLaunchKernel(m_fnZeroFloatBuffer, zBlocks, 1, 1, 256, 1, 1, 0, stream, pZero, nullptr);
-
-    int bMode = static_cast<int>(params.trailBlendMode);
-    void* pInit[] = {const_cast<int*>(&w), const_cast<int*>(&h), &shutterSrcRGBA, &bMode, &devAccum};
-    g_cu.cuLaunchKernel(m_fnTrailBaseInit, gx, gy, 1, bx, by, 1, 0, stream, pInit, nullptr);
-
     const int maxLookback = std::min(centerIdx, std::max(1, params.trailFrames - 1));
+    int bMode = static_cast<int>(params.trailBlendMode);
     int mMode = static_cast<int>(params.matteMode);
     int subSteps = params.subFrameSteps;
     float decay = params.trailDecay;
@@ -2162,68 +2746,230 @@ bool CudaEngine::renderFrame(
     float mt = params.motionThreshold;
     float lt = params.lumaThreshold;
     float hBoost = params.highlightBoost;
+    const float decayLambda = 0.25f + 3.2f * decay;
 
-    for (int k = 0; k <= maxLookback; ++k) {
-        int idxA = centerIdx - k;
-        int idxB = idxA - 1;
-        const FrameInput& fA = frames[idxA];
-        uint64_t rgbaA = (k == 0) ? shutterSrcRGBA : fA.deviceRGBA;
+    const int numPairs = maxLookback; // k = 0 .. numPairs - 1, plus oldest endpoint at centerIdx - maxLookback
+    const size_t workingSetBytes = static_cast<size_t>(numPairs) * rgbaBytes;
+    const bool canCacheSplats = (numPairs > 0) && (workingSetBytes <= cache.maxBytes());
+    const bool needsPairFlow = (subSteps > 1) || (params.trailBlendMode == eTrailLightPainting && mt > 0.0f);
 
-        int hasB = (idxB >= 0 && k < maxLookback) ? 1 : 0;
-        uint64_t rgbaB = hasB ? frames[idxB].deviceRGBA : rgbaA;
+    std::vector<std::shared_ptr<TrailSplatEntry>> pairRefs(numPairs);
+    std::vector<TrailSplatCacheKey> pairKeys(numPairs);
+    std::vector<bool> needCompute(numPairs, false);
+    std::vector<FlowPairResult> pairFlows(numPairs);
+    std::vector<bool> needFlowCompute(numPairs, false);
 
-        FlowPairResult pairFlowRes;
-        if (hasB) {
-            pairFlowRes = getOrComputeFlowPairCanonical(
-                instanceId,
-                fA.frameIndex, rgbaA, fA.deviceMatte, fA.matteComponents,
-                frames[idxB].frameIndex, rgbaB, frames[idxB].deviceMatte, frames[idxB].matteComponents,
-                params, cache, stream);
+    // 1. Lookup cached per-pair trail splats first so misses never evict active-window hits
+    for (int k = 0; k < numPairs; ++k) {
+        const FrameInput& fA = frames[centerIdx - k];
+        const FrameInput& fB = frames[centerIdx - k - 1];
+        bool pairHasMatte = (fA.deviceMatte != 0 && fA.matteComponents > 0);
+        bool cacheable = canCacheSplats && (k < 24) && !(params.mode == eModeCombined && k == 0);
+        if (cacheable) {
+            pairKeys[k] = makeTrailSplatCacheKey(instanceId, fA.frameIndex, fB.frameIndex, pairHasMatte, params);
+            pairRefs[k] = cache.getTrailSplat(pairKeys[k]);
+            if (!pairRefs[k]) {
+                needCompute[k] = true;
+            }
+        } else {
+            needCompute[k] = true;
+        }
+    }
+
+    // 2. Lookup cached flows for uncached pairs before computing missing flows
+    if (needsPairFlow) {
+        for (int k = 0; k < numPairs; ++k) {
+            if (!needCompute[k]) continue;
+            const FrameInput& fA = frames[centerIdx - k];
+            const FrameInput& fB = frames[centerIdx - k - 1];
+            const bool rev = (fA.frameIndex > fB.frameIndex);
+            const int fLow = rev ? fB.frameIndex : fA.frameIndex;
+            const int fHigh = rev ? fA.frameIndex : fB.frameIndex;
+            if (auto cachedFlow = cache.get(makeFlowCacheKey(instanceId, fLow, fHigh, params))) {
+                pairFlows[k] = {cachedFlow, rev};
+            } else {
+                needFlowCompute[k] = true;
+            }
+        }
+    }
+
+    const size_t tileActiveBytes = static_cast<size_t>(gx) * gy;
+    uint64_t devTileActive = 0;
+    uint64_t devPair0 = 0;
+    uint64_t devUncachedAccum = 0;
+
+    // 3. Compute missing flows & splat missing pairs oldest-to-newest (reusing boundary pyramids)
+    PyramidSet pyrCarry;
+    int carryIdx = -1;
+
+    for (int k = numPairs - 1; k >= 0; --k) {
+        if (!needCompute[k]) {
+            if (carryIdx != -1) {
+                releasePyramid(pyrCarry, stream);
+                carryIdx = -1;
+            }
+            continue;
         }
 
-        uint64_t matteA = 0;
-        if (hasMatte) {
-            matteA = (k == 0) ? devCurrMatte : acquireScratch(floatBufBytes, stream);
-            if (k > 0 && fA.deviceMatte && fA.matteComponents > 0) {
-                uint64_t tmpL = acquireScratch(floatBufBytes, stream);
-                int comp = fA.matteComponents;
-                void* pEx[] = {const_cast<int*>(&w), const_cast<int*>(&h), &rgbaA,
-                               const_cast<uint64_t*>(&fA.deviceMatte), &comp, &tmpL, &matteA};
-                g_cu.cuLaunchKernel(m_fnExtractLumaMatte, gx, gy, 1, bx, by, 1, 0, stream, pEx, nullptr);
-                releaseScratch(tmpL, floatBufBytes, stream);
+        const int idxA = centerIdx - k;
+        const int idxB = idxA - 1;
+        const FrameInput& fA = frames[idxA];
+        const FrameInput& fB = frames[idxB];
+
+        if (needsPairFlow && needFlowCompute[k]) {
+            PyramidSet pyrA, pyrB;
+            PyramidSet* ptrPyrB = (carryIdx == idxB) ? &pyrCarry : &pyrB;
+            if (carryIdx != idxB && carryIdx != -1) {
+                releasePyramid(pyrCarry, stream);
+                carryIdx = -1;
+            }
+
+            pairFlows[k] = getOrComputeFlowPairCanonical(
+                instanceId,
+                fA.frameIndex, fA.deviceRGBA, fA.deviceMatte, fA.matteComponents,
+                fB.frameIndex, fB.deviceRGBA, fB.deviceMatte, fB.matteComponents,
+                params, cache, stream, &pyrA, ptrPyrB, true);
+
+            if (carryIdx == idxB) {
+                releasePyramid(pyrCarry, stream);
+                carryIdx = -1;
+            } else {
+                releasePyramid(pyrB, stream);
+            }
+
+            if (pyrA.numLevels > 0 && k > 0 && needCompute[k - 1] && needFlowCompute[k - 1]) {
+                pyrCarry = pyrA;
+                carryIdx = idxA;
+            } else {
+                releasePyramid(pyrA, stream);
+            }
+        } else if (carryIdx != -1) {
+            releasePyramid(pyrCarry, stream);
+            carryIdx = -1;
+        }
+
+        if (!devTileActive) {
+            devTileActive = acquireScratch(tileActiveBytes, stream);
+        }
+
+        uint64_t rgbaA = (k == 0) ? shutterSrcRGBA : fA.deviceRGBA;
+        uint64_t rgbaB = fB.deviceRGBA;
+        uint64_t f4 = pairFlows[k].entry ? pairFlows[k].entry->devFlow4 : 0;
+        uint64_t c2 = pairFlows[k].entry ? pairFlows[k].entry->devConf2 : 0;
+        int flowRev = pairFlows[k].reversed ? 1 : 0;
+
+        uint64_t matteA = (hasMatte && mMode == 2 && fA.deviceMatte != 0 && fA.matteComponents > 0) ? fA.deviceMatte : 0;
+        int matteAComp = matteA ? fA.matteComponents : 0;
+        int pairHasMatte = matteA ? 1 : 0;
+
+        const bool isCombinedPair0 = (params.mode == eModeCombined && k == 0);
+        const bool storeAsPairEntry = canCacheSplats && !isCombinedPair0 && (k < 24);
+
+        uint64_t targetAccum = 0;
+        int pairAge = 0;
+        int addToExisting = 0;
+
+        if (isCombinedPair0) {
+            devPair0 = acquireScratch(rgbaBytes, stream);
+            targetAccum = devPair0;
+        } else if (storeAsPairEntry) {
+            auto entry = std::make_shared<TrailSplatEntry>();
+            entry->width = w;
+            entry->height = h;
+            entry->byteSize = rgbaBytes;
+            uint64_t ptr = acquireScratch(rgbaBytes, stream);
+            entry->devAccum4 = ptr;
+            entry->gpuFreeFn = [this, rgbaBytes, stream](uint64_t p) {
+                this->releaseScratch(p, rgbaBytes, stream);
+            };
+            if (ptr) {
+                targetAccum = ptr;
+                pairRefs[k] = entry;
             }
         }
 
-        uint64_t f4 = pairFlowRes.entry ? pairFlowRes.entry->devFlow4 : 0;
-        uint64_t c2 = pairFlowRes.entry ? pairFlowRes.entry->devConf2 : 0;
-        int flowRev = pairFlowRes.reversed ? 1 : 0;
-        int pairAge = k;
-        void* pSplat[] = {
-            const_cast<int*>(&w), const_cast<int*>(&h),
-            &rgbaA, &rgbaB, &f4, &c2, &flowRev,
-            &matteA, &hasMatte, &mMode,
-            &pairAge, &subSteps, &hasB,
-            &bMode, &decay, &sens, &mt, &lt,
-            &hBoost, &devAccum
-        };
-        g_cu.cuLaunchKernel(m_fnTrailSplatSubFrame, gx, gy, 1, bx, by, 1, 0, stream, pSplat, nullptr);
+        if (!targetAccum) {
+            if (!devUncachedAccum) {
+                devUncachedAccum = acquireScratch(rgbaBytes, stream);
+                if (devUncachedAccum) {
+                    memsetDevice(devUncachedAccum, 0, rgbaBytes, stream);
+                }
+            }
+            targetAccum = devUncachedAccum;
+            pairAge = k;
+            addToExisting = 1;
+        }
 
-        if (k > 0 && matteA) releaseScratch(matteA, floatBufBytes, stream);
+        if (targetAccum && devTileActive) {
+            void* pInit[] = {
+                const_cast<int*>(&w), const_cast<int*>(&h),
+                &rgbaA, &f4, &flowRev,
+                &matteA, &matteAComp, &pairHasMatte, &mMode,
+                &pairAge, &subSteps,
+                &bMode, &decay,
+                &sens, &mt, &lt,
+                &hBoost, &addToExisting,
+                &targetAccum, &devTileActive
+            };
+            g_cu.cuLaunchKernel(m_fnTrailPairInitStatic, gx, gy, 1, bx, by, 1, 0, stream, pInit, nullptr);
+
+            if (subSteps > 1 && f4) {
+                void* pSplat[] = {
+                    const_cast<int*>(&w), const_cast<int*>(&h),
+                    &rgbaA, &rgbaB, &f4, &c2, &flowRev,
+                    &matteA, &matteAComp, &pairHasMatte, &mMode,
+                    &pairAge, &subSteps,
+                    &bMode, &decay,
+                    &sens, &mt, &lt,
+                    &hBoost, &devTileActive, &targetAccum
+                };
+                g_cu.cuLaunchKernel(m_fnTrailPairSplatMoving, gx, gy, 1, bx, by, 1, 0, stream, pSplat, nullptr);
+            }
+
+            if (storeAsPairEntry && pairRefs[k]) {
+                cache.putTrailSplat(pairKeys[k], pairRefs[k]);
+            }
+        }
     }
 
-    float crisp = params.rearCurtainCrispness;
-    void* pFin[] = {
-        const_cast<int*>(&w), const_cast<int*>(&h),
-        &shutterSrcRGBA, &devAccum, &devCurrMatte,
-        &hasMatte, &mMode,
-        &bMode, &crisp,
-        &devOutputRGBA
-    };
-    g_cu.cuLaunchKernel(m_fnTrailFinalize, gx, gy, 1, bx, by, 1, 0, stream, pFin, nullptr);
+    if (carryIdx != -1) {
+        releasePyramid(pyrCarry, stream);
+        carryIdx = -1;
+    }
 
-    // Optional Sequential Accumulation Cache for ultra-long trails
+    TrailPairBatch batch{};
+    batch.count = 0;
+    batch.pad = 0;
+    for (int k = 0; k < numPairs && batch.count < 24; ++k) {
+        if (params.mode == eModeCombined && k == 0 && devPair0) {
+            batch.ptrs[batch.count] = devPair0;
+            batch.scales[batch.count] = 1.0f;
+            ++batch.count;
+        } else if (pairRefs[k] && pairRefs[k]->devAccum4) {
+            batch.ptrs[batch.count] = pairRefs[k]->devAccum4;
+            batch.scales[batch.count] = (bMode == 2) ? std::exp(-decayLambda * static_cast<float>(k)) : 1.0f;
+            ++batch.count;
+        }
+    }
+
+    const FrameInput& fLast = frames[centerIdx - maxLookback];
+    uint64_t lastRGBA = (maxLookback == 0) ? shutterSrcRGBA : fLast.deviceRGBA;
+    uint64_t lastMatte = (hasMatte && mMode == 2 && fLast.deviceMatte != 0 && fLast.matteComponents > 0) ? fLast.deviceMatte : 0;
+    int lastMatteComp = lastMatte ? fLast.matteComponents : 0;
+    int hasLastFrame = 1;
+    float lastTimeW = (bMode == 2 && maxLookback > 0) ? std::exp(-decayLambda * static_cast<float>(maxLookback)) : 1.0f;
+
+    uint64_t currMattePtr = (hasMatte && mMode == 2 && curr.deviceMatte != 0 && curr.matteComponents > 0) ? curr.deviceMatte : 0;
+    int currMatteComp = currMattePtr ? curr.matteComponents : 0;
+    int hasUncached = devUncachedAccum ? 1 : 0;
+    float crisp = params.rearCurtainCrispness;
+
+    float seqDecay = std::clamp(1.0f - decay * 0.5f, 0.1f, 0.96f);
+    uint64_t seqPrevLin = 0;
+    uint64_t seqOutLin = 0;
+    std::shared_ptr<SequentialTrailState> seq;
     if (params.sequentialCache) {
-        auto seq = cache.getOrCreateSequentialState(instanceId);
+        seq = cache.getOrCreateSequentialState(instanceId);
         if (!seq->isGpu || seq->width != w || seq->height != h || seq->lastFrame != curr.frameIndex - 1) {
             seq->reset();
             seq->isGpu = true;
@@ -2231,18 +2977,33 @@ bool CudaEngine::renderFrame(
             seq->height = h;
             seq->devAccumRGBA = allocDevice(rgbaBytes);
             seq->gpuFreeFn = [this](uint64_t ptr) { this->freeDevice(ptr); };
-            if (seq->devAccumRGBA) {
-                copyDeviceToDevice(seq->devAccumRGBA, devOutputRGBA, rgbaBytes, stream);
-            }
+            seqPrevLin = 0;
+            seqOutLin = seq->devAccumRGBA;
         } else if (seq->devAccumRGBA) {
-            void* pSeq[] = {const_cast<int*>(&w), const_cast<int*>(&h), &decay, &bMode, &seq->devAccumRGBA, &devOutputRGBA};
-            g_cu.cuLaunchKernel(m_fnApplySeqFeedback, gx, gy, 1, bx, by, 1, 0, stream, pSeq, nullptr);
-            copyDeviceToDevice(seq->devAccumRGBA, devOutputRGBA, rgbaBytes, stream);
+            seqPrevLin = seq->devAccumRGBA;
+            seqOutLin = seq->devAccumRGBA;
         }
         seq->lastFrame = curr.frameIndex;
     }
 
-    releaseScratch(devAccum, rgbaBytes, stream);
+    void* pFin[] = {
+        const_cast<int*>(&w), const_cast<int*>(&h),
+        &shutterSrcRGBA, &currMattePtr, &currMatteComp,
+        &lastRGBA, &lastMatte, &lastMatteComp,
+        &hasLastFrame, &lastTimeW,
+        &batch,
+        &devUncachedAccum, &hasUncached,
+        &hasMatte, &mMode, &bMode,
+        &mt, &lt, &hBoost,
+        &crisp,
+        &seqDecay, &seqPrevLin, &seqOutLin,
+        &devOutputRGBA
+    };
+    g_cu.cuLaunchKernel(m_fnTrailCompositeAndFinalize, gx, gy, 1, bx, by, 1, 0, stream, pFin, nullptr);
+
+    if (devTileActive) releaseScratch(devTileActive, tileActiveBytes, stream);
+    if (devPair0) releaseScratch(devPair0, rgbaBytes, stream);
+    if (devUncachedAccum) releaseScratch(devUncachedAccum, rgbaBytes, stream);
     if (intermediateShutterOut) releaseScratch(intermediateShutterOut, rgbaBytes, stream);
     if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
     return true;

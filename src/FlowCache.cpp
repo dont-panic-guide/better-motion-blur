@@ -15,6 +15,13 @@ FlowEntry::~FlowEntry() {
     }
 }
 
+TrailSplatEntry::~TrailSplatEntry() {
+    if (devAccum4 && gpuFreeFn) {
+        gpuFreeFn(devAccum4);
+        devAccum4 = 0;
+    }
+}
+
 SequentialTrailState::~SequentialTrailState() {
     reset();
 }
@@ -38,7 +45,7 @@ FlowCache::~FlowCache() {
 }
 
 FlowCache& FlowCache::global() {
-    static FlowCache instance(1536ULL * 1024ULL * 1024ULL); // 1.5 GB LRU budget on RTX 4090
+    static FlowCache instance(1536ULL * 1024ULL * 1024ULL); // Dynamically sized up to 5 GB at CUDA init
     return instance;
 }
 
@@ -48,6 +55,11 @@ void FlowCache::setMaxBytes(std::size_t maxBytes) {
     evictIfNeeded();
 }
 
+std::size_t FlowCache::maxBytes() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_maxBytes;
+}
+
 std::size_t FlowCache::currentBytes() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_currentBytes;
@@ -55,29 +67,64 @@ std::size_t FlowCache::currentBytes() const {
 
 std::shared_ptr<FlowEntry> FlowCache::get(const FlowCacheKey& key) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_map.find(key);
-    if (it == m_map.end()) {
+    auto it = m_flowMap.find(key);
+    if (it == m_flowMap.end()) {
         m_misses.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
-    // Move to front of LRU list
     m_lru.splice(m_lru.begin(), m_lru, it->second);
     m_hits.fetch_add(1, std::memory_order_relaxed);
-    return it->second->second;
+    return it->second->flow;
 }
 
 void FlowCache::put(const FlowCacheKey& key, const std::shared_ptr<FlowEntry>& entry) {
     if (!entry) return;
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_map.find(key);
-    if (it != m_map.end()) {
-        m_currentBytes -= it->second->second->byteSize;
-        it->second->second = entry;
+    auto it = m_flowMap.find(key);
+    if (it != m_flowMap.end()) {
+        m_currentBytes -= it->second->flow->byteSize;
+        it->second->flow = entry;
         m_currentBytes += entry->byteSize;
         m_lru.splice(m_lru.begin(), m_lru, it->second);
     } else {
-        m_lru.emplace_front(key, entry);
-        m_map.emplace(key, m_lru.begin());
+        LruItem item;
+        item.isSplat = false;
+        item.flowKey = key;
+        item.flow = entry;
+        m_lru.emplace_front(std::move(item));
+        m_flowMap.emplace(key, m_lru.begin());
+        m_currentBytes += entry->byteSize;
+    }
+    evictIfNeeded();
+}
+
+std::shared_ptr<TrailSplatEntry> FlowCache::getTrailSplat(const TrailSplatCacheKey& key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_splatMap.find(key);
+    if (it == m_splatMap.end()) {
+        return nullptr;
+    }
+    m_lru.splice(m_lru.begin(), m_lru, it->second);
+    m_hits.fetch_add(1, std::memory_order_relaxed);
+    return it->second->splat;
+}
+
+void FlowCache::putTrailSplat(const TrailSplatCacheKey& key, const std::shared_ptr<TrailSplatEntry>& entry) {
+    if (!entry) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_splatMap.find(key);
+    if (it != m_splatMap.end()) {
+        m_currentBytes -= it->second->splat->byteSize;
+        it->second->splat = entry;
+        m_currentBytes += entry->byteSize;
+        m_lru.splice(m_lru.begin(), m_lru, it->second);
+    } else {
+        LruItem item;
+        item.isSplat = true;
+        item.splatKey = key;
+        item.splat = entry;
+        m_lru.emplace_front(std::move(item));
+        m_splatMap.emplace(key, m_lru.begin());
         m_currentBytes += entry->byteSize;
     }
     evictIfNeeded();
@@ -86,8 +133,13 @@ void FlowCache::put(const FlowCacheKey& key, const std::shared_ptr<FlowEntry>& e
 void FlowCache::evictIfNeeded() {
     while (m_currentBytes > m_maxBytes && !m_lru.empty()) {
         auto last = std::prev(m_lru.end());
-        m_currentBytes -= last->second->byteSize;
-        m_map.erase(last->first);
+        if (last->isSplat) {
+            m_currentBytes -= last->splat->byteSize;
+            m_splatMap.erase(last->splatKey);
+        } else {
+            m_currentBytes -= last->flow->byteSize;
+            m_flowMap.erase(last->flowKey);
+        }
         m_lru.pop_back();
     }
 }
@@ -106,9 +158,15 @@ std::shared_ptr<SequentialTrailState> FlowCache::getOrCreateSequentialState(cons
 void FlowCache::invalidateInstance(const void* instanceId) {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto it = m_lru.begin(); it != m_lru.end();) {
-        if (it->first.instanceId == instanceId) {
-            m_currentBytes -= it->second->byteSize;
-            m_map.erase(it->first);
+        const void* owner = it->isSplat ? it->splatKey.instanceId : it->flowKey.instanceId;
+        if (owner == instanceId) {
+            if (it->isSplat) {
+                m_currentBytes -= it->splat->byteSize;
+                m_splatMap.erase(it->splatKey);
+            } else {
+                m_currentBytes -= it->flow->byteSize;
+                m_flowMap.erase(it->flowKey);
+            }
             it = m_lru.erase(it);
         } else {
             ++it;
@@ -119,7 +177,8 @@ void FlowCache::invalidateInstance(const void* instanceId) {
 
 void FlowCache::clear() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_map.clear();
+    m_flowMap.clear();
+    m_splatMap.clear();
     m_lru.clear();
     m_seqStates.clear();
     m_currentBytes = 0;

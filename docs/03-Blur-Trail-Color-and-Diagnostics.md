@@ -1,4 +1,4 @@
-<!-- doc-type: product-features -->
+<!-- doc-type: product-implementation -->
 # 03 — Shutter Blur, Long-Exposure Trails, Color & Diagnostics
 
 Primary files: [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [CpuFallbackProcessor.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CpuFallbackProcessor.cpp)
@@ -26,7 +26,8 @@ All pixel processing assumes incoming and outgoing images are in **DaVinci Wide 
    - `neighborMaxVelKernel` takes the `3×3` tile maximum (`vDom`), allowing fast-moving foreground edges to blur cleanly onto static background pixels.
 2. **Quadratic Sub-Frame Trajectory**:
    - Computes velocity `v0 = 0.5 * (vf - vb)` and curvature acceleration `a0 = vf + vb`.
-   - Integrates `shutterSamples` jittered taps across `[phaseCenter - 0.5 * shutterSpan, phaseCenter + 0.5 * shutterSpan]`:
+   - When `autoShutterSamples` is enabled (`true` by default), computes a tile-uniform sample count `effSamples = clamp(ceil(domSpeed * shutterSpan * 1.25), min(samples, 8), samples)` from the `16×16` `neighborMax` velocity `domSpeed` (zero intra-warp divergence).
+   - Integrates `effSamples` jittered taps across `[phaseCenter - 0.5 * shutterSpan, phaseCenter + 0.5 * shutterSpan]`:
      - Static-background pixels adjacent to fast foreground trace along `vDom * tau`.
      - Moving pixels trace along `v0 * tau + 0.5 * a0 * tau^2`.
 3. **Foreground Isolation & Depth Ordering**:
@@ -36,14 +37,17 @@ All pixel processing assumes incoming and outgoing images are in **DaVinci Wide 
 
 ---
 
-## 3. Long-Exposure Motion Trails (`trailSplatSubFrameKernel` & `trailFinalizeKernel`)
-Iterates over frame pairs `(idxA = centerIdx - k, idxB = idxA - 1)` for `k = 0 .. min(centerIdx, max(1, trailFrames - 1))`:
-- **Gapless Sub-Frame Bridging**: For moving pixels (`speed >= 0.35f`, `subFrameSteps > 1`), computes `adaptiveSteps = max(subFrameSteps, min(72, ceil(speed * 1.25)))` and bilinearly splats crossfaded linear RGB (`rA -> pB` weighted by `alpha * conf`) onto `accumRGBW` via `atomicAdd` / `atomicMaxFloat`.
-- **Blend Modes**:
-  - `0 — Physical Exposure (Linear)`: Energy-conserving linear integration weighted by `hdrW`.
-  - `1 — Light-Painting (Max/Screen)`: Early-rejects pixels failing `motionGate * lumaGate <= 0.01f` before sampling `frameB`, then splats peak envelopes via `atomicMaxFloat`.
-  - `2 — Comet / Rear-Curtain Decay`: Applies exponential decay `exp(-decayLambda * (k + alpha))` and blends sharp current frame at output via `rearCurtainCrispness`.
-- **Sequential Accumulation Cache**: When `sequentialCache == true` and playback advances sequentially (`curr.frameIndex == lastFrame + 1`), `applySeqFeedbackKernel` blends the prior frame's output in linear DWG light.
+## 3. Long-Exposure Motion Trails (`trailPairInitStaticKernel`, `trailPairSplatMovingKernel` & `trailCompositeAndFinalizeKernel`)
+Processes frame pairs `(idxA = centerIdx - k, idxB = idxA - 1)` for `k = 0 .. maxLookback - 1` (`maxLookback = min(centerIdx, max(1, trailFrames - 1))`) plus the oldest endpoint frame `centerIdx - maxLookback`:
+- **2-Pass Tile-Aware Shared-Memory Splatting**:
+  - **`trailPairInitStaticKernel`**: Non-atomically writes static/masked pixels with coalesced `float4` stores (skipping global zeroing), reads 1- or 4-channel mattes inline (`readMatteVal`), early-rejects gated Light-Painting pixels on `speed <= motionThreshold` before loading `frameA`, skips unused `log2f`/`powf` (using `ex * sqrtf(ex)` above `0.8f`), and outputs per-`16×16`-tile `tileActive` flags via `__syncthreads_or`.
+  - **`trailPairSplatMovingKernel`**: Skips static tiles immediately; reduces each active tile's trajectory bounding box via warp shuffles; for `boxArea <= 1536` (`24 KB` bank-conflict-free SoA `sR/sG/sB/sW`), splats in `__shared__` memory using register cell-coalescing, multiplicative exponential decay (`timeW *= decayMul`), and single-instruction hardware `atomicMax` (`atomicMaxPosFloat`) before flushing non-zero pixels in coalesced row order (falls back cleanly to cell-coalesced global splatting when `boxArea > 1536`).
+- **Per-Pair Factorization & Fused Finalize (`trailCompositeAndFinalizeKernel`)**:
+  - Every pair `(f, f-1)` is cached at `pairAgeIndex = 0` (`TrailSplatCache`) and composited in one pass with base `currRGBA`, oldest endpoint frame `centerIdx - maxLookback`, optional low-VRAM `uncachedAccum`, and `eModeCombined` `k == 0` shutter-blurred pair (`devPair0`):
+    - `0 — Physical Exposure (Linear)`: Linear integration weighted by `hdrW` (`scale = 1.0`).
+    - `1 — Light-Painting (Max/Screen)`: Peak-envelope `fmaxf` compositing with `motionGate * lumaGate` (`scale = 1.0`).
+    - `2 — Comet / Rear-Curtain Decay`: Applies exact scalar factorization `exp(-decayLambda * k)` per pair and blends sharp current frame via `rearCurtainCrispness`.
+- **Fused Linear Sequential Accumulation Cache**: When `sequentialCache == true` and playback advances sequentially (`curr.frameIndex == lastFrame + 1`), `trailCompositeAndFinalizeKernel` blends the prior frame's linear DWG buffer (`seq->devAccumRGBA`) directly before DW/I re-encoding with zero extra kernel launches or device-to-device copies.
 
 ---
 

@@ -397,6 +397,7 @@ std::shared_ptr<FlowEntry> CpuFallbackProcessor::getOrComputeFlowPair(
         params.height,
         static_cast<int>(params.flowEngine),
         static_cast<int>(std::lround(params.flowDetail * 20.0f)),
+        static_cast<int>(params.matteMode),
         false
     };
 
@@ -458,17 +459,22 @@ bool CpuFallbackProcessor::renderFrame(
     bool hasMatte = (curr.hostMatte != nullptr && curr.matteComponents > 0 && params.matteMode != eMatteIgnore);
 
     std::shared_ptr<FlowEntry> flowFwd, flowBwd;
-    if (centerIdx + 1 < static_cast<int>(frames.size()) && frames[centerIdx + 1].hostRGBA) {
-        flowFwd = getOrComputeFlowPair(instanceId,
-                                       curr.frameIndex, curr.hostRGBA, curr.hostMatte, curr.matteComponents,
-                                       frames[centerIdx + 1].frameIndex, frames[centerIdx + 1].hostRGBA, frames[centerIdx + 1].hostMatte, frames[centerIdx + 1].matteComponents,
-                                       params, cache);
-    }
-    if (centerIdx - 1 >= 0 && frames[centerIdx - 1].hostRGBA) {
-        flowBwd = getOrComputeFlowPair(instanceId,
-                                       curr.frameIndex, curr.hostRGBA, curr.hostMatte, curr.matteComponents,
-                                       frames[centerIdx - 1].frameIndex, frames[centerIdx - 1].hostRGBA, frames[centerIdx - 1].hostMatte, frames[centerIdx - 1].matteComponents,
-                                       params, cache);
+    const bool needsCenterFlow = (params.viewMode != eViewFinal) ||
+                                 (params.mode == eModeShutterBlur) ||
+                                 (params.mode == eModeCombined);
+    if (needsCenterFlow) {
+        if (centerIdx + 1 < static_cast<int>(frames.size()) && frames[centerIdx + 1].hostRGBA) {
+            flowFwd = getOrComputeFlowPair(instanceId,
+                                           curr.frameIndex, curr.hostRGBA, curr.hostMatte, curr.matteComponents,
+                                           frames[centerIdx + 1].frameIndex, frames[centerIdx + 1].hostRGBA, frames[centerIdx + 1].hostMatte, frames[centerIdx + 1].matteComponents,
+                                           params, cache);
+        }
+        if (centerIdx - 1 >= 0 && frames[centerIdx - 1].hostRGBA) {
+            flowBwd = getOrComputeFlowPair(instanceId,
+                                           curr.frameIndex, curr.hostRGBA, curr.hostMatte, curr.matteComponents,
+                                           frames[centerIdx - 1].frameIndex, frames[centerIdx - 1].hostRGBA, frames[centerIdx - 1].hostMatte, frames[centerIdx - 1].matteComponents,
+                                           params, cache);
+        }
     }
 
     if (params.viewMode != eViewFinal) {
@@ -585,8 +591,14 @@ bool CpuFallbackProcessor::renderFrame(
                 float fgCenter = (hasMatte && params.matteMode == eMatteForegroundIsolation) ? mC : (cSpeed > 0.35f * domSpeed ? 1.0f : 0.0f);
 
                 float ar = 0.0f, ag = 0.0f, ab = 0.0f, aa = 0.0f, aw = 0.0f, aaw = 0.0f;
-                for (int i = 0; i < params.shutterSamples; ++i) {
-                    float u = (i + 0.5f + 0.35f * jitter) / params.shutterSamples;
+                int effSamples = params.shutterSamples;
+                if (params.autoShutterSamples) {
+                    int minS = std::min(params.shutterSamples, 8);
+                    int adaptive = static_cast<int>(std::ceil(domSpeed * shutterSpan * 1.25f));
+                    effSamples = clampi(adaptive, minS, params.shutterSamples);
+                }
+                for (int i = 0; i < effSamples; ++i) {
+                    float u = (i + 0.5f + 0.35f * jitter) / static_cast<float>(effSamples);
                     float tau = phaseCenter + (u - 0.5f) * shutterSpan;
                     bool useDom = ((i & 1) == 1) && (domSpeed > cSpeed + 0.75f) && (fgCenter < 0.5f);
                     Float2 disp = useDom ? Float2{vDom.x * tau, vDom.y * tau}
@@ -681,20 +693,40 @@ bool CpuFallbackProcessor::renderFrame(
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
                 size_t idx = static_cast<size_t>(y) * w + x;
+                Float4 fl = pairFlow ? pairFlow->hostFlow4[idx] : Float4{0, 0, 0, 0};
+                float vx = fl.x * params.motionSensitivity;
+                float vy = fl.y * params.motionSensitivity;
+                float speed = std::hypot(vx, vy);
+
+                float mGate = 1.0f;
+                if (params.trailBlendMode == eTrailLightPainting && params.motionThreshold > 0.0f) {
+                    mGate = smoothstepf(params.motionThreshold, params.motionThreshold + 0.75f, speed);
+                    if (mGate <= 0.01f) continue;
+                }
+
                 const float* pA = rgbaA + idx * 4;
                 float rA = dwiToLinearChannel(pA[0]);
                 float gA = dwiToLinearChannel(pA[1]);
                 float bA = dwiToLinearChannel(pA[2]);
 
-                Float4 fl = pairFlow ? pairFlow->hostFlow4[idx] : Float4{0, 0, 0, 0};
-                float vx = fl.x * params.motionSensitivity;
-                float vy = fl.y * params.motionSensitivity;
-                float speed = std::hypot(vx, vy);
-                float luma = dwgLuminance(rA, gA, bA);
-                float lumaDwi = linearToDwiChannel(luma);
-                float mGate = params.motionThreshold > 0.0f ? smoothstepf(params.motionThreshold, params.motionThreshold + 0.75f, speed) : 1.0f;
-                float lGate = params.lumaThreshold > 0.0f ? smoothstepf(params.lumaThreshold, params.lumaThreshold + 0.12f, lumaDwi) : 1.0f;
-                float hdrW = 1.0f + params.highlightBoost * std::pow(std::max(0.0f, luma - 0.8f), 1.5f);
+                float lGate = 1.0f;
+                if (params.trailBlendMode == eTrailLightPainting && params.lumaThreshold > 0.0f) {
+                    float luma = dwgLuminance(rA, gA, bA);
+                    float lumaDwi = linearToDwiChannel(luma);
+                    lGate = smoothstepf(params.lumaThreshold, params.lumaThreshold + 0.12f, lumaDwi);
+                }
+                if (params.trailBlendMode == eTrailLightPainting && mGate * lGate <= 0.01f) {
+                    continue;
+                }
+
+                float hdrW = 1.0f;
+                if (params.trailBlendMode != eTrailLightPainting && params.highlightBoost > 0.0f) {
+                    float luma = dwgLuminance(rA, gA, bA);
+                    if (luma > 0.8f) {
+                        float ex = luma - 0.8f;
+                        hdrW += params.highlightBoost * ex * std::sqrt(ex);
+                    }
+                }
 
                 if (params.subFrameSteps <= 1 || !hasB || speed < 0.35f) {
                     float timeW = (params.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * k) : 1.0f;
@@ -723,6 +755,9 @@ bool CpuFallbackProcessor::renderFrame(
                 pB.z = dwiToLinearChannel(pB.z);
                 float conf = pairFlow ? pairFlow->hostConf2[idx].x : 1.0f;
 
+                float timeW = (params.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * static_cast<float>(k)) : 1.0f;
+                const float decayMul = (params.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * invSteps) : 1.0f;
+
                 for (int s = 0; s < steps; ++s) {
                     float alpha = s * invSteps;
                     float px = x + alpha * vx;
@@ -731,7 +766,6 @@ bool CpuFallbackProcessor::renderFrame(
                     float sr = rA * (1.0f - bb) + pB.x * bb;
                     float sg = gA * (1.0f - bb) + pB.y * bb;
                     float sb = bA * (1.0f - bb) + pB.z * bb;
-                    float timeW = (params.trailBlendMode == eTrailCometDecay) ? std::exp(-decayLambda * (k + alpha)) : 1.0f;
 
                     int x0 = static_cast<int>(std::floor(px));
                     int y0 = static_cast<int>(std::floor(py));
@@ -760,6 +794,7 @@ bool CpuFallbackProcessor::renderFrame(
                             }
                         }
                     }
+                    timeW *= decayMul;
                 }
             }
         }

@@ -1,4 +1,4 @@
-<!-- doc-type: product-features -->
+<!-- doc-type: product-implementation -->
 # 02 — Optical Flow Engine & Caching Architecture
 
 Primary files: [CudaEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.h), [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [NeuralFlowEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.h), [NeuralFlowEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.cpp), [OnnxModelGenerator.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/OnnxModelGenerator.h), [FlowCache.h](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/FlowCache.h), [FlowCache.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/FlowCache.cpp)
@@ -8,7 +8,7 @@ Primary files: [CudaEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%2
 ## 1. Shared Pyramids & Conditional Matte Processing
 - `CudaEngine::buildPyramid()` extracts perceptual DW/I luma once at level 0 via `extractLumaAndMatteKernel` (`__ldg` vectorized `float4` reads) and builds up to 5 levels (`>= 16×16`) via `downsample2xKernel`.
 - Matte pyramids are allocated and downsampled **only** when `matteMode == eMatteForegroundIsolation` and a valid matte buffer is attached (`needMatte == true`).
-- `getOrComputeFlowPairCanonical()` builds `pyrLow` and `pyrHigh` **once** per frame pair and invokes `launchFlowFromPyramids()` for both `low -> high` and `high -> low`.
+- `getOrComputeFlowPairCanonical()` reuses caller-supplied `PyramidSet`s (`pyrCurr` across `(t, t+1)` / `(t, t-1)`, and boundary frame pyramids across consecutive cold misses in Long-Exposure mode) so shared pyramids are built **once** per frame.
 
 ---
 
@@ -29,15 +29,18 @@ At `finestLevel` (`lvl = 2` for `>= 2560px`, `lvl = 1` for `>= 1024px`, `lvl = 0
 1. **`correlationFlowKernel`**: Preloads a `3×3` `lumaA` patch into registers and performs a `5×5` half-pixel correlation search with exact branch-and-bound early exit.
 2. **Residual Flow Refinement**:
    - **GPU-Native Fast Path (Default)**: When no external `neuflow_v2.onnx` file is loaded (`!NeuralFlowEngine::instance().isUsingExternalModel()`), `embeddedResidualRefineKernel` evaluates `refined = flow + 0.08 * Laplacian_3x3(flow)` directly in an `18×18` shared-memory tile — algebraically identical to `buildResidualFlowRefinementOnnx()` with zero PCIe transfer or stream sync.
-   - **External ONNX Path**: If `Contents/Resources/neuflow_v2.onnx` or `Contents/Win64/models/neuflow_v2.onnx` exists, `NeuralFlowEngine` loads Resolve's `onnxruntime.dll` (ORT 1.13.1 C API vtable slots) and runs `refineFlow` using persistent host staging buffers (`m_ortFlowBuf`, `m_ortGradBuf`, `m_ortInNchw4`, `m_ortOutNchw2`).
+   - **External ONNX Path**: If `Contents/Resources/neuflow_v2.onnx` or `Contents/Win64/models/neuflow_v2.onnx` exists, `NeuralFlowEngine` loads Resolve's `onnxruntime.dll` (ORT 1.13.1 C API vtable slots). During `initialize()`, files `<= 64 KB` are byte-compared against `buildResidualFlowRefinementOnnx()`; if byte-identical, `m_usingExternalModel` remains `false` so `CudaEngine` runs the GPU-native `embeddedResidualRefineKernel` with zero sync/PCIe overhead, while genuine custom external models run `refineFlow` via persistent host staging buffers.
 3. **4K Guided Upsampling (`jointBilateralUpsampleKernel`)**: Upsamples proxy flow to full resolution guided by full-res `lumaA[0]` and `matteA[0]`.
 
 ---
 
-## 4. Canonical Bidirectional `FlowCache` & Scratch Buffer Pool
-- **Canonical Key Ordering**: `getOrComputeFlowPairCanonical()` orders `(frameLow = min(A, B), frameHigh = max(A, B))`.
-  - `packBidirectionalKernel` stores `flow4 = (fwd.x, fwd.y, bwd.x, bwd.y)` and `conf2 = (confFwd, confBwd)`.
-  - Consumers receive `reversed = (frameAIndex > frameBIndex)` and read `.xy`/`.x` when `0` or `.zw`/`.y` when `1`.
+## 4. Canonical Bidirectional `FlowCache`, `TrailSplatCache` & Scratch Pool
+- **Canonical Key Ordering & FP16 Compression**: `getOrComputeFlowPairCanonical()` orders `(frameLow = min(A, B), frameHigh = max(A, B))` and keys by `matteMode` as well as engine/detail/resolution.
+  - `packBidirectionalKernel` stores `flow4` as packed FP16 `uint2` (`4× fp16` via inline PTX `cvt.rn.f16.f32`, `8 B/px`) and `conf2` as `uchar2` (`2 B/px`) — reducing GPU flow footprint from `24 B/px` (`199.1 MB` at 4K) to `10 B/px` (`82.9 MB` at 4K).
+  - Consumers receive `reversed = (frameAIndex > frameBIndex)` and unpack `.x`/`.y` via `readFlowVec()` / `readConfVal()`, or decode on host via `CudaEngine::downloadFlowToHost()`.
   - During sequential playback (`t -> t+1`), `t -> t-1` hits the `(t-1, t)` entry computed on the previous frame (~50% reduction in flow compute).
-- **LRU Budget**: `FlowCache::global()` defaults to a `1.5 GB` LRU budget and stores per-instance `SequentialTrailState`.
-- **Stream-Keyed Scratch Pool**: `CudaEngine::acquireScratch(bytes, stream)` / `releaseScratch(ptr, bytes, stream)` caches temporary GPU allocations per CUDA stream (`512 MB` cap) to avoid synchronous WDDM `cuMemAlloc`/`cuMemFree` stalls without cross-stream hazards.
+- **Per-Pair `TrailSplatCache` & Unified LRU Budget**:
+  - `FlowCache` stores both `FlowEntry` and age-0 `TrailSplatEntry` (`float4` per-pair splat) under a single LRU list and mode-canonicalized `TrailSplatCacheKey`.
+  - `CudaEngine::initialize()` queries `cuMemGetInfo_v2` and dynamically sets `FlowCache::global()` budget to `clamp(min(totalVRAM / 4, freeVRAM / 2), 1.5 GB, 5.0 GB)` (preventing 4K LRU thrashing up to `trailFrames = 24` on 24 GB GPUs; falls back to single-buffer uncached accumulation if a window exceeds budget).
+  - Active-window cache hits are resolved before misses, and misses compute oldest-to-newest (`k = maxLookback - 1` down to `0`) so newest pairs stay hottest in LRU.
+- **Stream-Keyed Scratch Pool (`768 MB` cap)**: `CudaEngine::acquireScratch(bytes, stream)` / `releaseScratch(ptr, bytes, stream)` caches temporary GPU buffers and evicted `FlowEntry` / `TrailSplatEntry` allocations per CUDA stream to avoid synchronous WDDM `cuMemAlloc`/`cuMemFree` stalls without cross-stream hazards.

@@ -182,13 +182,27 @@ bool NeuralFlowEngine::initialize(const std::string& modelPath) {
 
     m_usingExternalModel = false;
     if (!resolvedPath.empty() && std::filesystem::exists(resolvedPath)) {
+        std::error_code ec;
+        const auto fileSize = std::filesystem::file_size(resolvedPath, ec);
+        bool isEmbeddedDuplicate = false;
+        if (!ec && fileSize <= 64ULL * 1024ULL) {
+            std::ifstream ifs(std::filesystem::path(resolvedPath), std::ios::binary);
+            if (ifs.is_open()) {
+                std::vector<uint8_t> diskBytes(static_cast<size_t>(fileSize));
+                if (ifs.read(reinterpret_cast<char*>(diskBytes.data()), static_cast<std::streamsize>(fileSize))) {
+                    auto embeddedBytes = buildResidualFlowRefinementOnnx();
+                    isEmbeddedDuplicate = (diskBytes == embeddedBytes);
+                }
+            }
+        }
+
         std::wstring wpath = std::filesystem::path(resolvedPath).wstring();
         st = createSess(m_env, wpath.c_str(), m_sessionOpts, &m_session);
         if (st) {
             m_lastError = consumeStatus(m_ortSlots, st);
             m_session = nullptr;
         } else if (m_session) {
-            m_usingExternalModel = true;
+            m_usingExternalModel = !isEmbeddedDuplicate;
         }
     }
 

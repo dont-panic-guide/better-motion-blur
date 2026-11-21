@@ -41,6 +41,7 @@ constexpr const char* kParamMotionThreshold = "motionThreshold";
 constexpr const char* kParamMatteMode = "matteMode";
 constexpr const char* kParamShutterAngle = "shutterAngle";
 constexpr const char* kParamShutterPhase = "shutterPhase";
+constexpr const char* kParamAutoShutterSamples = "autoShutterSamples";
 constexpr const char* kParamShutterSamples = "shutterSamples";
 constexpr const char* kParamTrailFrames = "trailFrames";
 constexpr const char* kParamSubFrameSteps = "subFrameSteps";
@@ -50,6 +51,10 @@ constexpr const char* kParamRearCurtainCrispness = "rearCurtainCrispness";
 constexpr const char* kParamLumaThreshold = "lumaThreshold";
 constexpr const char* kParamSequentialCache = "sequentialCache";
 constexpr const char* kParamHighlightBoost = "highlightBoost";
+
+constexpr const char* kGroupShutter = "groupShutter";
+constexpr const char* kGroupTrail = "groupTrail";
+constexpr const char* kGroupPhoto = "groupPhoto";
 
 } // namespace
 
@@ -199,9 +204,11 @@ public:
     virtual void render(const OFX::RenderArguments& p_Args) override;
     virtual bool isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime) override;
     virtual void getFramesNeeded(const OFX::FramesNeededArguments& p_Args, OFX::FramesNeededSetter& p_FramesNeededSetter) override;
+    virtual void changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName) override;
 
 private:
     bmb::RenderParams readParamsAtTime(double time) const;
+    void updateParamVisibility();
 
     OFX::Clip* m_DstClip = nullptr;
     OFX::Clip* m_SrcClip = nullptr;
@@ -216,6 +223,7 @@ private:
     OFX::ChoiceParam* m_MatteModeParam = nullptr;
     OFX::DoubleParam* m_ShutterAngleParam = nullptr;
     OFX::DoubleParam* m_ShutterPhaseParam = nullptr;
+    OFX::BooleanParam* m_AutoShutterSamplesParam = nullptr;
     OFX::IntParam* m_ShutterSamplesParam = nullptr;
     OFX::IntParam* m_TrailFramesParam = nullptr;
     OFX::IntParam* m_SubFrameStepsParam = nullptr;
@@ -225,6 +233,9 @@ private:
     OFX::DoubleParam* m_LumaThresholdParam = nullptr;
     OFX::BooleanParam* m_SequentialCacheParam = nullptr;
     OFX::DoubleParam* m_HighlightBoostParam = nullptr;
+    OFX::GroupParam* m_GroupShutter = nullptr;
+    OFX::GroupParam* m_GroupTrail = nullptr;
+    OFX::GroupParam* m_GroupPhoto = nullptr;
 };
 
 BetterMotionBlurPlugin::BetterMotionBlurPlugin(OfxImageEffectHandle p_Handle)
@@ -245,6 +256,7 @@ BetterMotionBlurPlugin::BetterMotionBlurPlugin(OfxImageEffectHandle p_Handle)
     m_MatteModeParam = fetchChoiceParam(kParamMatteMode);
     m_ShutterAngleParam = fetchDoubleParam(kParamShutterAngle);
     m_ShutterPhaseParam = fetchDoubleParam(kParamShutterPhase);
+    m_AutoShutterSamplesParam = fetchBooleanParam(kParamAutoShutterSamples);
     m_ShutterSamplesParam = fetchIntParam(kParamShutterSamples);
     m_TrailFramesParam = fetchIntParam(kParamTrailFrames);
     m_SubFrameStepsParam = fetchIntParam(kParamSubFrameSteps);
@@ -254,11 +266,68 @@ BetterMotionBlurPlugin::BetterMotionBlurPlugin(OfxImageEffectHandle p_Handle)
     m_LumaThresholdParam = fetchDoubleParam(kParamLumaThreshold);
     m_SequentialCacheParam = fetchBooleanParam(kParamSequentialCache);
     m_HighlightBoostParam = fetchDoubleParam(kParamHighlightBoost);
+    m_GroupShutter = fetchGroupParam(kGroupShutter);
+    m_GroupTrail = fetchGroupParam(kGroupTrail);
+    m_GroupPhoto = fetchGroupParam(kGroupPhoto);
+
+    updateParamVisibility();
 }
 
 BetterMotionBlurPlugin::~BetterMotionBlurPlugin()
 {
     bmb::FlowCache::global().invalidateInstance(this);
+}
+
+void BetterMotionBlurPlugin::updateParamVisibility()
+{
+    auto setVisible = [](OFX::Param* p, bool visible) {
+        if (p) {
+            p->setIsSecret(!visible);
+            p->setEnabled(visible);
+        }
+    };
+
+    int mode = 0;
+    if (m_ModeParam) m_ModeParam->getValue(mode);
+    int blend = 0;
+    if (m_TrailBlendModeParam) m_TrailBlendModeParam->getValue(blend);
+    bool seqCache = false;
+    if (m_SequentialCacheParam) m_SequentialCacheParam->getValue(seqCache);
+
+    const bool showShutter = (mode == bmb::eModeShutterBlur || mode == bmb::eModeCombined);
+    const bool showTrail = (mode == bmb::eModeLongExposureTrail || mode == bmb::eModeCombined);
+    const bool showDecay = showTrail && (blend == bmb::eTrailCometDecay || seqCache);
+    const bool showCrisp = showTrail && (blend == bmb::eTrailCometDecay);
+    const bool showLuma = showTrail && (blend == bmb::eTrailLightPainting);
+    const bool showHighlight = !(mode == bmb::eModeLongExposureTrail && blend == bmb::eTrailLightPainting);
+    const bool showMatteMode = (getContext() == OFX::eContextGeneral);
+
+    if (m_GroupShutter) m_GroupShutter->setIsSecret(!showShutter);
+    setVisible(m_ShutterAngleParam, showShutter);
+    setVisible(m_ShutterPhaseParam, showShutter);
+    setVisible(m_AutoShutterSamplesParam, showShutter);
+    setVisible(m_ShutterSamplesParam, showShutter);
+
+    if (m_GroupTrail) m_GroupTrail->setIsSecret(!showTrail);
+    setVisible(m_TrailFramesParam, showTrail);
+    setVisible(m_SubFrameStepsParam, showTrail);
+    setVisible(m_TrailBlendModeParam, showTrail);
+    setVisible(m_SequentialCacheParam, showTrail);
+    setVisible(m_TrailDecayParam, showDecay);
+    setVisible(m_RearCurtainCrispnessParam, showCrisp);
+    setVisible(m_LumaThresholdParam, showLuma);
+
+    if (m_GroupPhoto) m_GroupPhoto->setIsSecret(!showHighlight);
+    setVisible(m_HighlightBoostParam, showHighlight);
+
+    setVisible(m_MatteModeParam, showMatteMode);
+}
+
+void BetterMotionBlurPlugin::changedParam(const OFX::InstanceChangedArgs& /*p_Args*/, const std::string& p_ParamName)
+{
+    if (p_ParamName == kParamMode || p_ParamName == kParamTrailBlendMode || p_ParamName == kParamSequentialCache) {
+        updateParamVisibility();
+    }
 }
 
 bmb::RenderParams BetterMotionBlurPlugin::readParamsAtTime(double time) const
@@ -279,6 +348,7 @@ bmb::RenderParams BetterMotionBlurPlugin::readParamsAtTime(double time) const
     p.matteMode = static_cast<bmb::MatteMode>(getChoice(m_MatteModeParam));
     p.shutterAngle = static_cast<float>(m_ShutterAngleParam->getValueAtTime(time));
     p.shutterPhase = static_cast<float>(m_ShutterPhaseParam->getValueAtTime(time));
+    p.autoShutterSamples = m_AutoShutterSamplesParam ? m_AutoShutterSamplesParam->getValueAtTime(time) : true;
     p.shutterSamples = std::max(4, m_ShutterSamplesParam->getValueAtTime(time));
     p.trailFrames = std::clamp(m_TrailFramesParam->getValueAtTime(time), 2, 24);
     p.subFrameSteps = std::clamp(m_SubFrameStepsParam->getValueAtTime(time), 1, 16);
@@ -308,7 +378,7 @@ void BetterMotionBlurPlugin::getFramesNeeded(const OFX::FramesNeededArguments& p
     const auto p = readParamsAtTime(p_Args.time);
     int lookback = 1;
     if (p.mode == bmb::eModeLongExposureTrail || p.mode == bmb::eModeCombined) {
-        lookback = std::max(1, p.trailFrames);
+        lookback = std::max(1, p.trailFrames - 1);
     }
 
     const bool needNextFrame = (p.mode != bmb::eModeLongExposureTrail) || (p.viewMode != bmb::eViewFinal);
@@ -317,7 +387,7 @@ void BetterMotionBlurPlugin::getFramesNeeded(const OFX::FramesNeededArguments& p
     range.max = p_Args.time + (needNextFrame ? 1.0 : 0.0);
 
     p_FramesNeededSetter.setFramesNeeded(*m_SrcClip, range);
-    if (m_MatteClip && m_MatteClip->isConnected()) {
+    if (m_MatteClip && m_MatteClip->isConnected() && p.matteMode != bmb::eMatteIgnore) {
         p_FramesNeededSetter.setFramesNeeded(*m_MatteClip, range);
     }
 }
@@ -339,7 +409,7 @@ void BetterMotionBlurPlugin::render(const OFX::RenderArguments& p_Args)
 
     const int currFrame = static_cast<int>(std::llround(p_Args.time));
     const int lookback = (params.mode == bmb::eModeLongExposureTrail || params.mode == bmb::eModeCombined)
-                             ? std::max(1, params.trailFrames)
+                             ? std::max(1, params.trailFrames - 1)
                              : 1;
 
     std::vector<std::unique_ptr<OFX::Image>> srcImages;
@@ -540,16 +610,17 @@ void BetterMotionBlurPluginFactory::describeInContext(OFX::ImageEffectDescriptor
     page->addChild(*matteModeParam);
 
     // Group: Natural Shutter Blur
-    OFX::GroupParamDescriptor* gShutter = p_Desc.defineGroupParam("groupShutter");
+    OFX::GroupParamDescriptor* gShutter = p_Desc.defineGroupParam(kGroupShutter);
     gShutter->setLabels("Natural Shutter Blur", "Natural Shutter Blur", "Natural Shutter Blur");
     page->addChild(*gShutter);
 
     page->addChild(*defDouble(p_Desc, kParamShutterAngle, "Shutter Angle (deg)", "Virtual camera shutter angle (180 = standard cinema)", 180.0, 0.0, 720.0, 0.0, 360.0, gShutter));
     page->addChild(*defDouble(p_Desc, kParamShutterPhase, "Shutter Phase (deg)", "Shutter temporal center offset", 0.0, -180.0, 180.0, -180.0, 180.0, gShutter));
-    page->addChild(*defInt(p_Desc, kParamShutterSamples, "Shutter Samples", "Sub-frame trajectory integration samples", 24, 8, 64, 8, 48, gShutter));
+    page->addChild(*defBool(p_Desc, kParamAutoShutterSamples, "Auto Shutter Samples", "Adapt sample count per 16x16 tile from optical flow speed (uses Shutter Samples as max cap)", true, gShutter));
+    page->addChild(*defInt(p_Desc, kParamShutterSamples, "Shutter Samples", "Sub-frame integration samples (acts as upper cap when Auto Shutter Samples is enabled)", 48, 8, 64, 8, 64, gShutter));
 
     // Group: Long-Exposure Trail
-    OFX::GroupParamDescriptor* gTrail = p_Desc.defineGroupParam("groupTrail");
+    OFX::GroupParamDescriptor* gTrail = p_Desc.defineGroupParam(kGroupTrail);
     gTrail->setLabels("Long-Exposure Trail", "Long-Exposure Trail", "Long-Exposure Trail");
     page->addChild(*gTrail);
 
@@ -572,7 +643,7 @@ void BetterMotionBlurPluginFactory::describeInContext(OFX::ImageEffectDescriptor
     page->addChild(*defBool(p_Desc, kParamSequentialCache, "Sequential Accumulation Cache", "Carry forward ultra-long trails during sequential playback", false, gTrail));
 
     // Group: Photometrics & Color
-    OFX::GroupParamDescriptor* gPhoto = p_Desc.defineGroupParam("groupPhoto");
+    OFX::GroupParamDescriptor* gPhoto = p_Desc.defineGroupParam(kGroupPhoto);
     gPhoto->setLabels("Photometrics & Color", "Photometrics & Color", "Photometrics & Color");
     page->addChild(*gPhoto);
 

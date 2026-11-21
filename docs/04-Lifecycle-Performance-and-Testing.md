@@ -1,4 +1,4 @@
-<!-- doc-type: product-features -->
+<!-- doc-type: product-implementation -->
 # 04 — Lifecycle, Performance & Verification
 
 Primary files: [CudaEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/CudaEngine.cpp), [NeuralFlowEngine.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/NeuralFlowEngine.cpp), [BetterMotionBlurPlugin.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/src/BetterMotionBlurPlugin.cpp), [TestRunner.cpp](file:///c:/Users/pan_y/Documents/Better%20Motion%20Blur/tests/TestRunner.cpp)
@@ -39,4 +39,6 @@ Run `.\build\Release\BetterMotionBlurTests.exe` after building `Release`:
 | **Test 5** | LRU `FlowCache` hit rate across sequential window | `hits=12, misses=2, hitRate=85.7%` (`>= 85%`) |
 | **Test 6** | `BetterMotionBlur.ofx` DLL exports & plugin ID | `OfxGetNumberOfPlugins == 1`, ID `com.BetterMotionBlur.OFX.BetterMotionBlur` |
 | **Test 7** | Graceful `shutdown()`, stale `freeDevice` no-op, & re-init | Exits `0` cleanly |
-| **Test 8** | 1080p & 4K GPU performance + canonical cache reuse | `1080p Neural=28.9ms (35 fps, hit=50%)`, `Pyr=12.1ms (83 fps)` \| `4K Neural=34.1ms (29.3 fps)` |
+| **Test 8** | 1080p & 4K GPU performance + canonical cache reuse | `1080p Neural=4.7ms (212 fps, hit=50%)`, `Pyr=10.6ms (95 fps)` \| `4K Neural=10.1ms (99.2 fps)` |
+| **Test 9** | Long-Exposure parity (Physical/Comet/Diag >40px fallback/Seq/Combined) & 1080p/4K cache non-thrashing | `RefPhys=0.00000`, `RefComet=0.00000`, `1080p8=16.5ms (60 fps, hit=86%)`, `4K8=32.3ms (31.0 fps, hit=86%)`, `4K16=18.3ms (54.7 fps, hit=93%)` |
+| **Test 10** | Tile-adaptive `autoShutterSamples` (mixed velocity, static preservation, GPU/CPU parity, `eModeCombined`) | `StaticDiff=0.00e+00`, `GpuCpuMeanDiff=0.0013` |

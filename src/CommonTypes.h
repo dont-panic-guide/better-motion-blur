@@ -50,7 +50,8 @@ struct RenderParams {
 
     float shutterAngle = 180.0f;     // 0.0 - 720.0 deg
     float shutterPhase = 0.0f;       // -180.0 - +180.0 deg
-    int shutterSamples = 24;         // 8 - 64
+    bool autoShutterSamples = true;  // Tile-adaptive sample count
+    int shutterSamples = 48;         // 8 - 64 (max cap when autoShutterSamples is true)
 
     int trailFrames = 8;             // 2 - 24
     int subFrameSteps = 6;           // 1 - 16

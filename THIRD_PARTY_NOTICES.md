@@ -1,4 +1,3 @@
-<!-- doc-type: product-features -->
 # Third-Party Notices & Runtime Permissions
 
 ## OpenFX 1.4 SDK & Support Library (BSD-3-Clause)

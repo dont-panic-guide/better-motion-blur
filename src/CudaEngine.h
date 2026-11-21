@@ -62,6 +62,12 @@ public:
         const RenderParams& params,
         FlowCache& cache);
 
+    // Downloads GPU FlowEntry (decoding FP16 flow if packed) into host Float4 vectors.
+    bool downloadFlowToHost(
+        const FlowEntry& entry,
+        std::vector<Float4>& outHostFlow,
+        void* stream = nullptr);
+
     void shutdown();
 
 private:
@@ -109,7 +115,10 @@ private:
         int frameBIndex, uint64_t devFrameB, uint64_t devMatteB, int matteBComp,
         const RenderParams& params,
         FlowCache& cache,
-        void* stream);
+        void* stream,
+        PyramidSet* callerPyrA = nullptr,
+        PyramidSet* callerPyrB = nullptr,
+        bool skipCacheLookup = false);
 
     std::mutex m_mutex;
     std::atomic<bool> m_alive{true};
@@ -125,8 +134,8 @@ private:
     void* m_ownedCtx = nullptr;
     void* m_module = nullptr;
 
-    // Stream-keyed GPU scratch buffer pool (512 MB cap)
-    static constexpr size_t kMaxScratchPoolBytes = 512ULL * 1024ULL * 1024ULL;
+    // Stream-keyed GPU scratch buffer pool (768 MB cap)
+    static constexpr size_t kMaxScratchPoolBytes = 768ULL * 1024ULL * 1024ULL;
     std::mutex m_scratchMutex;
     std::unordered_map<uintptr_t, std::unordered_map<size_t, std::vector<uint64_t>>> m_scratchPool;
     size_t m_scratchPoolBytes = 0;
@@ -152,11 +161,9 @@ private:
     void* m_fnTileMaxVel = nullptr;
     void* m_fnNeighborMaxVel = nullptr;
     void* m_fnShutterBlur = nullptr;
-    void* m_fnZeroFloatBuffer = nullptr;
-    void* m_fnTrailBaseInit = nullptr;
-    void* m_fnTrailSplatSubFrame = nullptr;
-    void* m_fnTrailFinalize = nullptr;
-    void* m_fnApplySeqFeedback = nullptr;
+    void* m_fnTrailPairInitStatic = nullptr;
+    void* m_fnTrailPairSplatMoving = nullptr;
+    void* m_fnTrailCompositeAndFinalize = nullptr;
     void* m_fnRenderDiagnostic = nullptr;
 };
 
