@@ -25,7 +25,7 @@ A GPU-accelerated OpenFX 1.4 plugin (`BetterMotionBlur.ofx.bundle`) for **DaVinc
 - **Host Software:** DaVinci Resolve (OpenFX 1.4 compatible host)
 - **GPU (Recommended):** NVIDIA GPU (Compute Capability 7.5+ / Turing or newer) with up-to-date NVIDIA drivers (`nvcuda.dll`) and NVRTC (`nvrtc64_120_0.dll`, included with DaVinci Resolve or CUDA Toolkit 12.x). A CPU fallback is used automatically if CUDA is unavailable.
 - **Optional External Neural Model:** `onnxruntime.dll` (provided by DaVinci Resolve) when using a custom external `neuflow_v2.onnx` model; otherwise, the built-in GPU-native residual refinement kernel is used.
-- **Building from Source (Optional):** CMake `>= 3.20`, MSVC with C++17 (x64), and the OpenFX 1.4 SDK.
+- **Building from Source (Optional):** CMake `>= 3.20` and MSVC with C++17 (x64) — OpenFX 1.4 headers and support library are vendored in `third_party/openfx`.
 
 ## Download
 
@@ -48,7 +48,7 @@ cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-If the OpenFX 1.4 SDK is not in the default DaVinci Resolve developer directory, pass `-DOFX_SDK_ROOT=<path-to-openfx-sdk>` during the configure step.
+If you want to build against an external OpenFX 1.4 SDK instead of `third_party/openfx`, pass `-DOFX_SDK_ROOT=<path-to-openfx-sdk>` during the configure step.
 
 ## License
 

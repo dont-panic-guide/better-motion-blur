@@ -16,18 +16,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Fetch OpenFX 1.4 SDK
-        shell: pwsh
-        run: |
-          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$env:RUNNER_TEMP/openfx"
-          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/ofx_sdk/OpenFX-1.4" | Out-Null
-          Copy-Item -Recurse "$env:RUNNER_TEMP/openfx/include" "$env:RUNNER_TEMP/ofx_sdk/OpenFX-1.4/include"
-          Copy-Item -Recurse "$env:RUNNER_TEMP/openfx/Support" "$env:RUNNER_TEMP/ofx_sdk/Support"
-
       - name: Configure CMake
         shell: pwsh
         run: |
-          cmake -B build -A x64 -DOFX_SDK_ROOT="$env:RUNNER_TEMP/ofx_sdk"
+          cmake -B build -A x64
 
       - name: Build Release
         shell: pwsh

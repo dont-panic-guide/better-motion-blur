@@ -4,7 +4,7 @@ project(BetterMotionBlur LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(OFX_SDK_ROOT "C:/ProgramData/Blackmagic Design/DaVinci Resolve/Support/Developer/OpenFX" CACHE PATH "Path to OpenFX SDK")
+set(OFX_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openfx" CACHE PATH "Path to OpenFX SDK")
 
 set(OFX_SUPPORT_SOURCES
     "${OFX_SDK_ROOT}/Support/Library/ofxsCore.cpp"
