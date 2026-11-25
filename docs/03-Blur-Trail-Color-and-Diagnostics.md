@@ -21,33 +21,30 @@ All pixel processing assumes incoming and outgoing images are in **DaVinci Wide 
 ---
 
 ## 2. Natural Shutter Blur (`synthesizeShutterBlurKernel`)
-1. **Velocity Dilation (`tileMaxVelKernel` + `neighborMaxVelKernel`)**:
-   - `tileMaxVelKernel` launches one `16×16` coalesced block per `16×16` tile and performs a shared-memory parallel max reduction on gated center velocity `v0 = 0.5 * (vf - vb) * sensitivity`.
-   - `neighborMaxVelKernel` takes the `3×3` tile maximum (`vDom`), allowing fast-moving foreground edges to blur cleanly onto static background pixels.
-2. **Quadratic Sub-Frame Trajectory**:
-   - Computes velocity `v0 = 0.5 * (vf - vb)` and curvature acceleration `a0 = vf + vb`.
-   - When `autoShutterSamples` is enabled (`true` by default), computes a tile-uniform sample count `effSamples = clamp(ceil(domSpeed * shutterSpan * 1.25), min(samples, 8), samples)` from the `16×16` `neighborMax` velocity `domSpeed` (zero intra-warp divergence).
-   - Integrates `effSamples` jittered taps across `[phaseCenter - 0.5 * shutterSpan, phaseCenter + 0.5 * shutterSpan]`:
-     - Static-background pixels adjacent to fast foreground trace along `vDom * tau`.
-     - Moving pixels trace along `v0 * tau + 0.5 * a0 * tau^2`.
-3. **Foreground Isolation & Depth Ordering**:
-   - With `matteMode == eMatteForegroundIsolation`: foreground samples reject static background taps (zero background bleed); background pixels accept foreground taps whose blur reach covers `(x, y)`.
-   - Without matte: attenuates static background bleed into fast foreground (`wSample = 0.05f` when `centerSpeed > 1.5 && sSpeed < 0.35 * centerSpeed`).
-   - Uses vectorized `float4` `__ldg` loads/stores and defers `flowFwd[sIdx]` / `flowBwd[sIdx]` reads until required by the active branch.
+1. **Confidence-Weighted Bidirectional Velocity & Separable Dilation (`tileMaxVelKernel` + `neighborMaxVelHKernel` / `neighborMaxVelVKernel`)**:
+   - `evalConfWeightedVelAcc` weights `vf` and `-vb` by `conf^2 + 0.02` (preserving true speed under single-sided temporal occlusion instead of halving) and scales curvature `a0` by `min(cf, cb)^2`.
+   - `tileMaxVelKernel` launches one `16×16` coalesced block per `16×16` tile and performs a shared-memory parallel max reduction on gated `(v0, a0)` (`float4`).
+   - `neighborMaxVelHKernel` and `neighborMaxVelVKernel` perform separable 1D dilation across dynamic `tileRadius = clamp(ceil(0.14 * width * maxHalfSpan / 16), 1, 12)` (`up to 192 px` half-blur reach at 4K).
+2. **Inverse Quadratic Trajectory & Multi-Frame Disocclusion**:
+   - When `autoShutterSamples` is enabled (`true` by default), computes a tile-uniform sample count `effSamples = clamp(ceil(max(centerSpeed, domSpeed) * shutterSpan * 1.25), min(samples, 8), samples)` from `neighborMax` and local velocity (zero intra-warp divergence).
+   - Integrates `effSamples` jittered taps across `[phaseCenter - 0.5 * shutterSpan, phaseCenter + 0.5 * shutterSpan]` using inverse gather displacement `-v * tau - 0.5 * a * tau^2`:
+     - Exterior / static-background taps (`useDom`) trace along `(-vDom, -aDom)` and test curved arrival `tauStar` and perpendicular miss distance `perpDist`; foreground hits accumulate with Jacobian weight `clamp(domSpeed / max(sSpeed, 1), 1, 2.5)` capped to `fgFrac = clamp(fgTime / effSamples, 0, 1)`, while misses accumulate unoccluded static `centerLin` (`bgFrac = 1 - fgFrac`) for exact linear `50% -> 0%` silhouette ramps.
+     - Interior moving pixels stepping off the silhouette check zero-cost reverse flow (`vAtPrev`, `vAtNext`) / neighbor mattes at `(x, y)` to sample true disoccluded background from `prevRGBA` (`t-1`) or `nextRGBA` (`t+1`) when uncovered, and suppress static foreground occluders (`0.0` with matte, `0.05` without matte).
+   - When `shutterSubFrames` (`>= 3` distinct fractional sub-frames) are provided, `renderFrame()` runs piecewise Voronoi-weighted `renderSingleShutterPass()` segments and blends them in linear DWG via `accumLinearFromDwiKernel` + `encodeLinearToDwiKernel`.
 
 ---
 
 ## 3. Long-Exposure Motion Trails (`trailPairInitStaticKernel`, `trailPairSplatMovingKernel` & `trailCompositeAndFinalizeKernel`)
 Processes frame pairs `(idxA = centerIdx - k, idxB = idxA - 1)` for `k = 0 .. maxLookback - 1` (`maxLookback = min(centerIdx, max(1, trailFrames - 1))`) plus the oldest endpoint frame `centerIdx - maxLookback`:
 - **2-Pass Tile-Aware Shared-Memory Splatting**:
-  - **`trailPairInitStaticKernel`**: Non-atomically writes static/masked pixels with coalesced `float4` stores (skipping global zeroing), reads 1- or 4-channel mattes inline (`readMatteVal`), early-rejects gated Light-Painting pixels on `speed <= motionThreshold` before loading `frameA`, skips unused `log2f`/`powf` (using `ex * sqrtf(ex)` above `0.8f`), and outputs per-`16×16`-tile `tileActive` flags via `__syncthreads_or`.
-  - **`trailPairSplatMovingKernel`**: Skips static tiles immediately; reduces each active tile's trajectory bounding box via warp shuffles; for `boxArea <= 1536` (`24 KB` bank-conflict-free SoA `sR/sG/sB/sW`), splats in `__shared__` memory using register cell-coalescing, multiplicative exponential decay (`timeW *= decayMul`), and single-instruction hardware `atomicMax` (`atomicMaxPosFloat`) before flushing non-zero pixels in coalesced row order (falls back cleanly to cell-coalesced global splatting when `boxArea > 1536`).
+  - **`trailPairInitStaticKernel`**: Non-atomically writes static/masked pixels with coalesced `float4` stores (skipping global zeroing), reads 1- or 4-channel mattes inline (`readMatteVal`), suppresses non-foreground background emission when `matteMode == 1` (`Foreground Isolation`), early-rejects gated Light-Painting pixels on `speed <= motionThreshold` before loading `frameA`, skips unused `log2f`/`powf`, scales Comet decay by `pairTimeStep`, and outputs per-`16×16`-tile `tileActive` flags via `__syncthreads_or`.
+  - **`trailPairSplatMovingKernel`**: Skips static tiles immediately; gates moving emission by `matteA` when `matteMode == 1`; fits a time-invariant confidence-gated quadratic curve $\mathbf{p}(\alpha)$ from `pairFlows[k+1]` ($t_{k-1} \to t_{k-2}$, preserving `TrailSplatCache` invariance with zero extra flow passes); reduces the exact quadratic trajectory bounding box via warp shuffles; for `boxArea <= 1536` (`24 KB` bank-conflict-free SoA `sR/sG/sB/sW`), splats in `__shared__` memory using register cell-coalescing, multiplicative exponential decay (`timeW *= decayMul` scaled by `pairTimeStep`), and single-instruction hardware `atomicMax` (`atomicMaxPosFloat`) before flushing non-zero pixels in coalesced row order.
 - **Per-Pair Factorization & Fused Finalize (`trailCompositeAndFinalizeKernel`)**:
   - Every pair `(f, f-1)` is cached at `pairAgeIndex = 0` (`TrailSplatCache`) and composited in one pass with base `currRGBA`, oldest endpoint frame `centerIdx - maxLookback`, optional low-VRAM `uncachedAccum`, and `eModeCombined` `k == 0` shutter-blurred pair (`devPair0`):
-    - `0 — Physical Exposure (Linear)`: Linear integration weighted by `hdrW` (`scale = 1.0`).
+    - `0 — Physical Exposure (Linear)`: Linear integration weighted by `hdrW` (`scale = 1.0`). When `matteMode == 1` (`Foreground Isolation`), composites accumulated foreground exposure over unoccluded background (`bgW = max(0, totalWindowW - acc.w)`) so shaky/moving backgrounds stay crisp.
     - `1 — Light-Painting (Max/Screen)`: Peak-envelope `fmaxf` compositing with `motionGate * lumaGate` (`scale = 1.0`).
-    - `2 — Comet / Rear-Curtain Decay`: Applies exact scalar factorization `exp(-decayLambda * k)` per pair and blends sharp current frame via `rearCurtainCrispness`.
-- **Fused Linear Sequential Accumulation Cache**: When `sequentialCache == true` and playback advances sequentially (`curr.frameIndex == lastFrame + 1`), `trailCompositeAndFinalizeKernel` blends the prior frame's linear DWG buffer (`seq->devAccumRGBA`) directly before DW/I re-encoding with zero extra kernel launches or device-to-device copies.
+    - `2 — Comet / Rear-Curtain Decay`: Applies exact scalar factorization `exp(-decayLambda * k * pairTimeStep)` per pair, backfills vacated low-weight wakes (`acc.w < 0.25`) from `lastRGBA`, and blends sharp current frame via `rearCurtainCrispness`.
+- **Fused Linear Sequential Accumulation Cache**: When `sequentialCache == true` and playback advances sequentially (`curr.frameIndex == lastFrame + 1`), `trailCompositeAndFinalizeKernel` blends the prior frame's linear DWG buffer (`seq->devAccumRGBA`) directly before DW/I re-encoding with zero extra kernel launches or device-to-device copies, and skips re-decaying when `isDuplicateFrame == true`.
 
 ---
 

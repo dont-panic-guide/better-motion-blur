@@ -41,9 +41,11 @@ constexpr const char* kParamMotionThreshold = "motionThreshold";
 constexpr const char* kParamMatteMode = "matteMode";
 constexpr const char* kParamShutterAngle = "shutterAngle";
 constexpr const char* kParamShutterPhase = "shutterPhase";
+constexpr const char* kParamShutterTimebase = "shutterTimebase";
 constexpr const char* kParamAutoShutterSamples = "autoShutterSamples";
 constexpr const char* kParamShutterSamples = "shutterSamples";
 constexpr const char* kParamTrailFrames = "trailFrames";
+constexpr const char* kParamTrailTimebase = "trailTimebase";
 constexpr const char* kParamSubFrameSteps = "subFrameSteps";
 constexpr const char* kParamTrailBlendMode = "trailBlendMode";
 constexpr const char* kParamTrailDecay = "trailDecay";
@@ -70,7 +72,16 @@ public:
                         std::vector<std::unique_ptr<OFX::Image>> matteImages,
                         std::vector<int> frameIndices,
                         int centerIdx,
-                        const bmb::RenderParams& params)
+                        const bmb::RenderParams& params,
+                        bool probePulldown = false,
+                        std::vector<std::unique_ptr<OFX::Image>> subImages = {},
+                        std::vector<std::unique_ptr<OFX::Image>> subMatteImages = {},
+                        std::vector<int> subFrameIndices = {},
+                        std::vector<float> subRelTimes = {},
+                        std::vector<std::unique_ptr<OFX::Image>> trailSubImages = {},
+                        std::vector<std::unique_ptr<OFX::Image>> trailSubMatteImages = {},
+                        std::vector<int> trailSubFrameIndices = {},
+                        float trailPairTimeStep = 1.0f)
     {
         m_instanceId = instanceId;
         m_srcImages = std::move(srcImages);
@@ -78,6 +89,15 @@ public:
         m_frameIndices = std::move(frameIndices);
         m_centerIdx = centerIdx;
         m_params = params;
+        m_probePulldown = probePulldown;
+        m_subImages = std::move(subImages);
+        m_subMatteImages = std::move(subMatteImages);
+        m_subFrameIndices = std::move(subFrameIndices);
+        m_subRelTimes = std::move(subRelTimes);
+        m_trailSubImages = std::move(trailSubImages);
+        m_trailSubMatteImages = std::move(trailSubMatteImages);
+        m_trailSubFrameIndices = std::move(trailSubFrameIndices);
+        m_trailPairTimeStep = trailPairTimeStep;
     }
 
     virtual void processImagesCUDA() override
@@ -91,20 +111,138 @@ public:
         m_params.height = bounds.y2 - bounds.y1;
         if (m_params.width <= 0 || m_params.height <= 0) return;
 
+        auto makeGpuFrame = [](const OFX::Image* img, const OFX::Image* mImg, int frameIdx, float relT) {
+            bmb::FrameInput f;
+            f.frameIndex = frameIdx;
+            f.relTime = relT;
+            f.deviceRGBA = reinterpret_cast<uint64_t>(img->getPixelData());
+            if (mImg) {
+                f.deviceMatte = reinterpret_cast<uint64_t>(mImg->getPixelData());
+                f.matteComponents = (mImg->getPixelComponents() == OFX::ePixelComponentAlpha) ? 1 : 4;
+            }
+            return f;
+        };
+
         std::vector<bmb::FrameInput> gpuFrames(m_srcImages.size());
         for (size_t i = 0; i < m_srcImages.size(); ++i) {
-            gpuFrames[i].frameIndex = m_frameIndices[i];
-            gpuFrames[i].deviceRGBA = reinterpret_cast<uint64_t>(m_srcImages[i]->getPixelData());
-            if (i < m_matteImages.size() && m_matteImages[i]) {
-                gpuFrames[i].deviceMatte = reinterpret_cast<uint64_t>(m_matteImages[i]->getPixelData());
-                gpuFrames[i].matteComponents =
-                    (m_matteImages[i]->getPixelComponents() == OFX::ePixelComponentAlpha) ? 1 : 4;
+            const OFX::Image* mImg = (i < m_matteImages.size()) ? m_matteImages[i].get() : nullptr;
+            gpuFrames[i] = makeGpuFrame(m_srcImages[i].get(), mImg, m_frameIndices[i], 0.0f);
+        }
+
+        std::vector<bmb::FrameInput> distinctSubFrames;
+        const std::vector<bmb::FrameInput>* subPtr = nullptr;
+        if (m_subImages.size() >= 3) {
+            for (size_t i = 0; i < m_subImages.size(); ++i) {
+                if (!m_subImages[i]) continue;
+                const OFX::Image* mImg = (i < m_subMatteImages.size()) ? m_subMatteImages[i].get() : nullptr;
+                bmb::FrameInput sf = makeGpuFrame(m_subImages[i].get(), mImg, m_subFrameIndices[i], m_subRelTimes[i]);
+                if (distinctSubFrames.empty() ||
+                    bmb::CudaEngine::instance().areFramesDistinct(
+                        distinctSubFrames.back().deviceRGBA, sf.deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                    distinctSubFrames.push_back(sf);
+                }
+            }
+            if (distinctSubFrames.size() >= 3) {
+                subPtr = &distinctSubFrames;
+            }
+        }
+
+        std::vector<bmb::FrameInput> distinctTrailSub;
+        const std::vector<bmb::FrameInput>* renderFramesPtr = &gpuFrames;
+        int renderCenterIdx = m_centerIdx;
+
+        if (m_trailSubImages.size() >= 2 && (m_params.mode == bmb::eModeLongExposureTrail || m_params.mode == bmb::eModeCombined)) {
+            for (size_t i = 0; i < m_trailSubImages.size(); ++i) {
+                if (!m_trailSubImages[i]) continue;
+                const OFX::Image* mImg = (i < m_trailSubMatteImages.size()) ? m_trailSubMatteImages[i].get() : nullptr;
+                bmb::FrameInput tf = makeGpuFrame(m_trailSubImages[i].get(), mImg, m_trailSubFrameIndices[i], 0.0f);
+                if (distinctTrailSub.empty() ||
+                    bmb::CudaEngine::instance().areFramesDistinct(
+                        distinctTrailSub.back().deviceRGBA, tf.deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                    distinctTrailSub.push_back(tf);
+                }
+            }
+            if (distinctTrailSub.size() >= 2) {
+                renderCenterIdx = static_cast<int>(distinctTrailSub.size()) - 1;
+                if (m_params.mode == bmb::eModeCombined && m_centerIdx + 1 < static_cast<int>(gpuFrames.size())) {
+                    distinctTrailSub.push_back(gpuFrames[m_centerIdx + 1]);
+                }
+                m_params.pairTimeStep = m_trailPairTimeStep;
+                m_params.trailFrames = renderCenterIdx + 1;
+                renderFramesPtr = &distinctTrailSub;
+            }
+        }
+
+        std::vector<bmb::FrameInput> pulldownFrames;
+        if (renderFramesPtr == &gpuFrames && m_probePulldown && gpuFrames.size() > 2) {
+            if (m_centerIdx > 0 &&
+                !bmb::CudaEngine::instance().areFramesDistinct(
+                    gpuFrames[m_centerIdx].deviceRGBA, gpuFrames[m_centerIdx - 1].deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                m_params.isDuplicateFrame = true;
+            }
+            if (m_params.mode == bmb::eModeShutterBlur) {
+                if (!subPtr && gpuFrames.size() > 3) {
+                    int prevIdx = -1;
+                    for (int i = m_centerIdx - 1; i >= 0; --i) {
+                        if (bmb::CudaEngine::instance().areFramesDistinct(
+                                gpuFrames[m_centerIdx].deviceRGBA, gpuFrames[i].deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                            prevIdx = i;
+                            m_params.bwdFrameStep = static_cast<float>(m_centerIdx - i);
+                            break;
+                        }
+                    }
+                    int nextIdx = -1;
+                    for (int i = m_centerIdx + 1; i < static_cast<int>(gpuFrames.size()); ++i) {
+                        if (bmb::CudaEngine::instance().areFramesDistinct(
+                                gpuFrames[m_centerIdx].deviceRGBA, gpuFrames[i].deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                            nextIdx = i;
+                            m_params.fwdFrameStep = static_cast<float>(i - m_centerIdx);
+                            break;
+                        }
+                    }
+                    if (prevIdx >= 0) pulldownFrames.push_back(gpuFrames[prevIdx]);
+                    renderCenterIdx = static_cast<int>(pulldownFrames.size());
+                    pulldownFrames.push_back(gpuFrames[m_centerIdx]);
+                    if (nextIdx >= 0) pulldownFrames.push_back(gpuFrames[nextIdx]);
+                    renderFramesPtr = &pulldownFrames;
+                }
+            } else {
+                std::vector<int> keptRev;
+                keptRev.push_back(m_centerIdx);
+                int maxKeep = (m_params.trailTimebase == bmb::eTimebaseClipFps) ? m_params.trailFrames : 64;
+                for (int i = m_centerIdx - 1; i >= 0 && static_cast<int>(keptRev.size()) < maxKeep; --i) {
+                    if (bmb::CudaEngine::instance().areFramesDistinct(
+                            gpuFrames[keptRev.back()].deviceRGBA, gpuFrames[i].deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                        keptRev.push_back(i);
+                    }
+                }
+                for (auto it = keptRev.rbegin(); it != keptRev.rend(); ++it) {
+                    pulldownFrames.push_back(gpuFrames[*it]);
+                }
+                renderCenterIdx = static_cast<int>(pulldownFrames.size()) - 1;
+                if (keptRev.size() >= 2) {
+                    m_params.bwdFrameStep = static_cast<float>(m_centerIdx - keptRev[1]);
+                }
+                if (m_params.mode == bmb::eModeCombined) {
+                    for (int i = m_centerIdx + 1; i < static_cast<int>(gpuFrames.size()); ++i) {
+                        if (bmb::CudaEngine::instance().areFramesDistinct(
+                                gpuFrames[m_centerIdx].deviceRGBA, gpuFrames[i].deviceRGBA, m_params.width, m_params.height, _pCudaStream)) {
+                            m_params.fwdFrameStep = static_cast<float>(i - m_centerIdx);
+                            pulldownFrames.push_back(gpuFrames[i]);
+                            break;
+                        }
+                    }
+                }
+                if (pulldownFrames.size() >= 2) {
+                    m_params.trailFrames = renderCenterIdx + 1;
+                    renderFramesPtr = &pulldownFrames;
+                }
             }
         }
 
         uint64_t devOut = reinterpret_cast<uint64_t>(_dstImg->getPixelData());
         bmb::CudaEngine::instance().renderFrame(
-            m_instanceId, gpuFrames, m_centerIdx, devOut, m_params, bmb::FlowCache::global(), _pCudaStream);
+            m_instanceId, *renderFramesPtr, renderCenterIdx, devOut, m_params, bmb::FlowCache::global(), _pCudaStream, subPtr);
     }
 
     virtual void preProcess() override
@@ -123,40 +261,153 @@ public:
         m_params.height = h;
         const size_t nPix = static_cast<size_t>(w) * h;
 
-        m_cpuPackedSrc.resize(m_srcImages.size());
-        m_cpuPackedMatte.resize(m_srcImages.size());
-        std::vector<bmb::FrameInput> cpuFrames(m_srcImages.size());
-
-        for (size_t i = 0; i < m_srcImages.size(); ++i) {
-            m_cpuPackedSrc[i].resize(nPix * 4);
-            OFX::Image* img = m_srcImages[i].get();
-            for (int y = 0; y < h; ++y) {
-                const float* row = static_cast<const float*>(img->getPixelAddress(bounds.x1, bounds.y1 + y));
-                if (row) {
-                    std::memcpy(m_cpuPackedSrc[i].data() + static_cast<size_t>(y) * w * 4, row, static_cast<size_t>(w) * 4 * sizeof(float));
-                }
-            }
-            cpuFrames[i].frameIndex = m_frameIndices[i];
-            cpuFrames[i].hostRGBA = m_cpuPackedSrc[i].data();
-
-            if (i < m_matteImages.size() && m_matteImages[i]) {
-                OFX::Image* mImg = m_matteImages[i].get();
-                int comp = (mImg->getPixelComponents() == OFX::ePixelComponentAlpha) ? 1 : 4;
-                m_cpuPackedMatte[i].resize(nPix * comp);
+        auto packFrames = [&](const std::vector<std::unique_ptr<OFX::Image>>& imgs,
+                              const std::vector<std::unique_ptr<OFX::Image>>& mattes,
+                              const std::vector<int>& indices,
+                              const std::vector<float>* relTimes,
+                              std::vector<std::vector<float>>& outPackedSrc,
+                              std::vector<std::vector<float>>& outPackedMatte,
+                              std::vector<bmb::FrameInput>& outCpuFrames) {
+            outPackedSrc.resize(imgs.size());
+            outPackedMatte.resize(imgs.size());
+            outCpuFrames.resize(imgs.size());
+            for (size_t i = 0; i < imgs.size(); ++i) {
+                outPackedSrc[i].resize(nPix * 4);
+                OFX::Image* img = imgs[i].get();
                 for (int y = 0; y < h; ++y) {
-                    const float* row = static_cast<const float*>(mImg->getPixelAddress(bounds.x1, bounds.y1 + y));
+                    const float* row = static_cast<const float*>(img->getPixelAddress(bounds.x1, bounds.y1 + y));
                     if (row) {
-                        std::memcpy(m_cpuPackedMatte[i].data() + static_cast<size_t>(y) * w * comp, row, static_cast<size_t>(w) * comp * sizeof(float));
+                        std::memcpy(outPackedSrc[i].data() + static_cast<size_t>(y) * w * 4, row, static_cast<size_t>(w) * 4 * sizeof(float));
                     }
                 }
-                cpuFrames[i].hostMatte = m_cpuPackedMatte[i].data();
-                cpuFrames[i].matteComponents = comp;
+                outCpuFrames[i].frameIndex = indices[i];
+                outCpuFrames[i].relTime = relTimes ? (*relTimes)[i] : 0.0f;
+                outCpuFrames[i].hostRGBA = outPackedSrc[i].data();
+
+                if (i < mattes.size() && mattes[i]) {
+                    OFX::Image* mImg = mattes[i].get();
+                    int comp = (mImg->getPixelComponents() == OFX::ePixelComponentAlpha) ? 1 : 4;
+                    outPackedMatte[i].resize(nPix * comp);
+                    for (int y = 0; y < h; ++y) {
+                        const float* row = static_cast<const float*>(mImg->getPixelAddress(bounds.x1, bounds.y1 + y));
+                        if (row) {
+                            std::memcpy(outPackedMatte[i].data() + static_cast<size_t>(y) * w * comp, row, static_cast<size_t>(w) * comp * sizeof(float));
+                        }
+                    }
+                    outCpuFrames[i].hostMatte = outPackedMatte[i].data();
+                    outCpuFrames[i].matteComponents = comp;
+                }
+            }
+        };
+
+        m_cpuPackedSrc.clear();
+        m_cpuPackedMatte.clear();
+        std::vector<bmb::FrameInput> cpuFrames;
+        packFrames(m_srcImages, m_matteImages, m_frameIndices, nullptr, m_cpuPackedSrc, m_cpuPackedMatte, cpuFrames);
+
+        std::vector<bmb::FrameInput> cpuSubFrames, distinctSubFrames;
+        const std::vector<bmb::FrameInput>* subPtr = nullptr;
+        if (m_subImages.size() >= 3) {
+            packFrames(m_subImages, m_subMatteImages, m_subFrameIndices, &m_subRelTimes, m_cpuPackedSubSrc, m_cpuPackedSubMatte, cpuSubFrames);
+            for (const auto& sf : cpuSubFrames) {
+                if (distinctSubFrames.empty() ||
+                    bmb::CpuFallbackProcessor::areFramesDistinct(distinctSubFrames.back().hostRGBA, sf.hostRGBA, w, h)) {
+                    distinctSubFrames.push_back(sf);
+                }
+            }
+            if (distinctSubFrames.size() >= 3) {
+                subPtr = &distinctSubFrames;
+            }
+        }
+
+        std::vector<bmb::FrameInput> cpuTrailSub, distinctTrailSub;
+        const std::vector<bmb::FrameInput>* renderFramesPtr = &cpuFrames;
+        int renderCenterIdx = m_centerIdx;
+
+        if (m_trailSubImages.size() >= 2 && (m_params.mode == bmb::eModeLongExposureTrail || m_params.mode == bmb::eModeCombined)) {
+            packFrames(m_trailSubImages, m_trailSubMatteImages, m_trailSubFrameIndices, nullptr, m_cpuPackedTrailSubSrc, m_cpuPackedTrailSubMatte, cpuTrailSub);
+            for (const auto& tf : cpuTrailSub) {
+                if (distinctTrailSub.empty() ||
+                    bmb::CpuFallbackProcessor::areFramesDistinct(distinctTrailSub.back().hostRGBA, tf.hostRGBA, w, h)) {
+                    distinctTrailSub.push_back(tf);
+                }
+            }
+            if (distinctTrailSub.size() >= 2) {
+                renderCenterIdx = static_cast<int>(distinctTrailSub.size()) - 1;
+                if (m_params.mode == bmb::eModeCombined && m_centerIdx + 1 < static_cast<int>(cpuFrames.size())) {
+                    distinctTrailSub.push_back(cpuFrames[m_centerIdx + 1]);
+                }
+                m_params.pairTimeStep = m_trailPairTimeStep;
+                m_params.trailFrames = renderCenterIdx + 1;
+                renderFramesPtr = &distinctTrailSub;
+            }
+        }
+
+        std::vector<bmb::FrameInput> pulldownFrames;
+        if (renderFramesPtr == &cpuFrames && m_probePulldown && cpuFrames.size() > 2) {
+            if (m_centerIdx > 0 &&
+                !bmb::CpuFallbackProcessor::areFramesDistinct(cpuFrames[m_centerIdx].hostRGBA, cpuFrames[m_centerIdx - 1].hostRGBA, w, h)) {
+                m_params.isDuplicateFrame = true;
+            }
+            if (m_params.mode == bmb::eModeShutterBlur) {
+                if (!subPtr && cpuFrames.size() > 3) {
+                    int prevIdx = -1;
+                    for (int i = m_centerIdx - 1; i >= 0; --i) {
+                        if (bmb::CpuFallbackProcessor::areFramesDistinct(cpuFrames[m_centerIdx].hostRGBA, cpuFrames[i].hostRGBA, w, h)) {
+                            prevIdx = i;
+                            m_params.bwdFrameStep = static_cast<float>(m_centerIdx - i);
+                            break;
+                        }
+                    }
+                    int nextIdx = -1;
+                    for (int i = m_centerIdx + 1; i < static_cast<int>(cpuFrames.size()); ++i) {
+                        if (bmb::CpuFallbackProcessor::areFramesDistinct(cpuFrames[m_centerIdx].hostRGBA, cpuFrames[i].hostRGBA, w, h)) {
+                            nextIdx = i;
+                            m_params.fwdFrameStep = static_cast<float>(i - m_centerIdx);
+                            break;
+                        }
+                    }
+                    if (prevIdx >= 0) pulldownFrames.push_back(cpuFrames[prevIdx]);
+                    renderCenterIdx = static_cast<int>(pulldownFrames.size());
+                    pulldownFrames.push_back(cpuFrames[m_centerIdx]);
+                    if (nextIdx >= 0) pulldownFrames.push_back(cpuFrames[nextIdx]);
+                    renderFramesPtr = &pulldownFrames;
+                }
+            } else {
+                std::vector<int> keptRev;
+                keptRev.push_back(m_centerIdx);
+                int maxKeep = (m_params.trailTimebase == bmb::eTimebaseClipFps) ? m_params.trailFrames : 64;
+                for (int i = m_centerIdx - 1; i >= 0 && static_cast<int>(keptRev.size()) < maxKeep; --i) {
+                    if (bmb::CpuFallbackProcessor::areFramesDistinct(cpuFrames[keptRev.back()].hostRGBA, cpuFrames[i].hostRGBA, w, h)) {
+                        keptRev.push_back(i);
+                    }
+                }
+                for (auto it = keptRev.rbegin(); it != keptRev.rend(); ++it) {
+                    pulldownFrames.push_back(cpuFrames[*it]);
+                }
+                renderCenterIdx = static_cast<int>(pulldownFrames.size()) - 1;
+                if (keptRev.size() >= 2) {
+                    m_params.bwdFrameStep = static_cast<float>(m_centerIdx - keptRev[1]);
+                }
+                if (m_params.mode == bmb::eModeCombined) {
+                    for (int i = m_centerIdx + 1; i < static_cast<int>(cpuFrames.size()); ++i) {
+                        if (bmb::CpuFallbackProcessor::areFramesDistinct(cpuFrames[m_centerIdx].hostRGBA, cpuFrames[i].hostRGBA, w, h)) {
+                            m_params.fwdFrameStep = static_cast<float>(i - m_centerIdx);
+                            pulldownFrames.push_back(cpuFrames[i]);
+                            break;
+                        }
+                    }
+                }
+                if (pulldownFrames.size() >= 2) {
+                    m_params.trailFrames = renderCenterIdx + 1;
+                    renderFramesPtr = &pulldownFrames;
+                }
             }
         }
 
         m_cpuOutput.resize(nPix * 4);
         bmb::CpuFallbackProcessor::renderFrame(
-            m_instanceId, cpuFrames, m_centerIdx, m_cpuOutput.data(), m_params, bmb::FlowCache::global());
+            m_instanceId, *renderFramesPtr, renderCenterIdx, m_cpuOutput.data(), m_params, bmb::FlowCache::global(), subPtr);
     }
 
     virtual void multiThreadProcessImages(OfxRectI p_ProcWindow) override
@@ -188,9 +439,22 @@ private:
     std::vector<int> m_frameIndices;
     int m_centerIdx = 0;
     bmb::RenderParams m_params;
+    bool m_probePulldown = false;
+    std::vector<std::unique_ptr<OFX::Image>> m_subImages;
+    std::vector<std::unique_ptr<OFX::Image>> m_subMatteImages;
+    std::vector<int> m_subFrameIndices;
+    std::vector<float> m_subRelTimes;
+    std::vector<std::unique_ptr<OFX::Image>> m_trailSubImages;
+    std::vector<std::unique_ptr<OFX::Image>> m_trailSubMatteImages;
+    std::vector<int> m_trailSubFrameIndices;
+    float m_trailPairTimeStep = 1.0f;
 
     std::vector<std::vector<float>> m_cpuPackedSrc;
     std::vector<std::vector<float>> m_cpuPackedMatte;
+    std::vector<std::vector<float>> m_cpuPackedSubSrc;
+    std::vector<std::vector<float>> m_cpuPackedSubMatte;
+    std::vector<std::vector<float>> m_cpuPackedTrailSubSrc;
+    std::vector<std::vector<float>> m_cpuPackedTrailSubMatte;
     std::vector<float> m_cpuOutput;
 };
 
@@ -208,6 +472,7 @@ public:
 
 private:
     bmb::RenderParams readParamsAtTime(double time) const;
+    void queryFrameRates(double& outTimelineFps, double& outClipFps) const;
     void updateParamVisibility();
 
     OFX::Clip* m_DstClip = nullptr;
@@ -223,9 +488,11 @@ private:
     OFX::ChoiceParam* m_MatteModeParam = nullptr;
     OFX::DoubleParam* m_ShutterAngleParam = nullptr;
     OFX::DoubleParam* m_ShutterPhaseParam = nullptr;
+    OFX::ChoiceParam* m_ShutterTimebaseParam = nullptr;
     OFX::BooleanParam* m_AutoShutterSamplesParam = nullptr;
     OFX::IntParam* m_ShutterSamplesParam = nullptr;
     OFX::IntParam* m_TrailFramesParam = nullptr;
+    OFX::ChoiceParam* m_TrailTimebaseParam = nullptr;
     OFX::IntParam* m_SubFrameStepsParam = nullptr;
     OFX::ChoiceParam* m_TrailBlendModeParam = nullptr;
     OFX::DoubleParam* m_TrailDecayParam = nullptr;
@@ -256,9 +523,11 @@ BetterMotionBlurPlugin::BetterMotionBlurPlugin(OfxImageEffectHandle p_Handle)
     m_MatteModeParam = fetchChoiceParam(kParamMatteMode);
     m_ShutterAngleParam = fetchDoubleParam(kParamShutterAngle);
     m_ShutterPhaseParam = fetchDoubleParam(kParamShutterPhase);
+    m_ShutterTimebaseParam = fetchChoiceParam(kParamShutterTimebase);
     m_AutoShutterSamplesParam = fetchBooleanParam(kParamAutoShutterSamples);
     m_ShutterSamplesParam = fetchIntParam(kParamShutterSamples);
     m_TrailFramesParam = fetchIntParam(kParamTrailFrames);
+    m_TrailTimebaseParam = fetchChoiceParam(kParamTrailTimebase);
     m_SubFrameStepsParam = fetchIntParam(kParamSubFrameSteps);
     m_TrailBlendModeParam = fetchChoiceParam(kParamTrailBlendMode);
     m_TrailDecayParam = fetchDoubleParam(kParamTrailDecay);
@@ -305,11 +574,13 @@ void BetterMotionBlurPlugin::updateParamVisibility()
     if (m_GroupShutter) m_GroupShutter->setIsSecret(!showShutter);
     setVisible(m_ShutterAngleParam, showShutter);
     setVisible(m_ShutterPhaseParam, showShutter);
+    setVisible(m_ShutterTimebaseParam, showShutter);
     setVisible(m_AutoShutterSamplesParam, showShutter);
     setVisible(m_ShutterSamplesParam, showShutter);
 
     if (m_GroupTrail) m_GroupTrail->setIsSecret(!showTrail);
     setVisible(m_TrailFramesParam, showTrail);
+    setVisible(m_TrailTimebaseParam, showTrail);
     setVisible(m_SubFrameStepsParam, showTrail);
     setVisible(m_TrailBlendModeParam, showTrail);
     setVisible(m_SequentialCacheParam, showTrail);
@@ -330,6 +601,26 @@ void BetterMotionBlurPlugin::changedParam(const OFX::InstanceChangedArgs& /*p_Ar
     }
 }
 
+void BetterMotionBlurPlugin::queryFrameRates(double& outTimelineFps, double& outClipFps) const
+{
+    double tl = getFrameRate();
+    if (tl <= 0.01 && m_DstClip) tl = m_DstClip->getFrameRate();
+    if (tl <= 0.01) tl = 24.0;
+
+    double cl = tl;
+    if (m_SrcClip && m_SrcClip->isConnected()) {
+        double unmapped = m_SrcClip->getUnmappedFrameRate();
+        if (unmapped > 0.01) {
+            cl = unmapped;
+        } else {
+            double mapped = m_SrcClip->getFrameRate();
+            if (mapped > 0.01) cl = mapped;
+        }
+    }
+    outTimelineFps = tl;
+    outClipFps = cl;
+}
+
 bmb::RenderParams BetterMotionBlurPlugin::readParamsAtTime(double time) const
 {
     auto getChoice = [time](OFX::ChoiceParam* param) -> int {
@@ -348,9 +639,18 @@ bmb::RenderParams BetterMotionBlurPlugin::readParamsAtTime(double time) const
     p.matteMode = static_cast<bmb::MatteMode>(getChoice(m_MatteModeParam));
     p.shutterAngle = static_cast<float>(m_ShutterAngleParam->getValueAtTime(time));
     p.shutterPhase = static_cast<float>(m_ShutterPhaseParam->getValueAtTime(time));
+    p.shutterTimebase = static_cast<bmb::ShutterTimebase>(getChoice(m_ShutterTimebaseParam));
+    if (p.shutterTimebase == bmb::eTimebaseClipFps) {
+        double tlFps = 24.0, clFps = 24.0;
+        queryFrameRates(tlFps, clFps);
+        p.timebaseScale = std::clamp(static_cast<float>(tlFps / clFps), 0.05f, 8.0f);
+    } else {
+        p.timebaseScale = 1.0f;
+    }
     p.autoShutterSamples = m_AutoShutterSamplesParam ? m_AutoShutterSamplesParam->getValueAtTime(time) : true;
     p.shutterSamples = std::max(4, m_ShutterSamplesParam->getValueAtTime(time));
     p.trailFrames = std::clamp(m_TrailFramesParam->getValueAtTime(time), 2, 24);
+    p.trailTimebase = static_cast<bmb::ShutterTimebase>(getChoice(m_TrailTimebaseParam));
     p.subFrameSteps = std::clamp(m_SubFrameStepsParam->getValueAtTime(time), 1, 16);
     p.trailBlendMode = static_cast<bmb::TrailBlendMode>(getChoice(m_TrailBlendModeParam));
     p.trailDecay = static_cast<float>(m_TrailDecayParam->getValueAtTime(time));
@@ -382,9 +682,47 @@ void BetterMotionBlurPlugin::getFramesNeeded(const OFX::FramesNeededArguments& p
     }
 
     const bool needNextFrame = (p.mode != bmb::eModeLongExposureTrail) || (p.viewMode != bmb::eViewFinal);
+    double minOff = -static_cast<double>(lookback);
+    double maxOff = needNextFrame ? 1.0 : 0.0;
+
+    if (p.viewMode == bmb::eViewFinal) {
+        double tlFps = 24.0, clFps = 24.0;
+        queryFrameRates(tlFps, clFps);
+        const bool trailActive = (p.mode == bmb::eModeLongExposureTrail || p.mode == bmb::eModeCombined);
+        const bool shutterActive = (p.mode == bmb::eModeShutterBlur || p.mode == bmb::eModeCombined);
+
+        if (trailActive) {
+            if (tlFps > clFps * 1.05) {
+                int maxPull = std::clamp(static_cast<int>(std::ceil(tlFps / clFps)), 1, 4);
+                int trailSpan = (p.trailTimebase == bmb::eTimebaseClipFps)
+                                    ? std::min(60, static_cast<int>(std::ceil((p.trailFrames - 1) * (tlFps / clFps))) + maxPull)
+                                    : std::min(60, lookback + maxPull);
+                minOff = std::min(minOff, -static_cast<double>(trailSpan));
+                if (shutterActive) maxOff = std::max(maxOff, static_cast<double>(maxPull));
+            } else if (clFps > tlFps * 1.05 && p.trailTimebase == bmb::eTimebaseClipFps) {
+                int scaledLookback = std::max(1, static_cast<int>(std::ceil((p.trailFrames - 1) * (tlFps / clFps))));
+                minOff = std::min(minOff, -static_cast<double>(scaledLookback));
+            }
+        }
+        if (shutterActive) {
+            if (tlFps > clFps * 1.05) {
+                int maxPull = std::clamp(static_cast<int>(std::ceil(tlFps / clFps)), 1, 4);
+                minOff = std::min(minOff, -static_cast<double>(maxPull));
+                maxOff = std::max(maxOff, static_cast<double>(maxPull));
+            } else if (clFps > tlFps * 1.05) {
+                double effSpan = (p.shutterAngle / 360.0) * p.timebaseScale;
+                double effPhase = (p.shutterPhase / 360.0) * p.timebaseScale;
+                double lo = std::clamp(std::floor(effPhase - 0.5 * effSpan - 1.0), -4.0, 0.0);
+                double hi = std::clamp(std::ceil(effPhase + 0.5 * effSpan + 1.0), 0.0, 4.0);
+                minOff = std::min(minOff, lo);
+                maxOff = std::max(maxOff, hi);
+            }
+        }
+    }
+
     OfxRangeD range;
-    range.min = p_Args.time - static_cast<double>(lookback);
-    range.max = p_Args.time + (needNextFrame ? 1.0 : 0.0);
+    range.min = p_Args.time + minOff;
+    range.max = p_Args.time + maxOff;
 
     p_FramesNeededSetter.setFramesNeeded(*m_SrcClip, range);
     if (m_MatteClip && m_MatteClip->isConnected() && p.matteMode != bmb::eMatteIgnore) {
@@ -400,7 +738,7 @@ void BetterMotionBlurPlugin::render(const OFX::RenderArguments& p_Args)
         return;
     }
 
-    const bmb::RenderParams params = readParamsAtTime(p_Args.time);
+    bmb::RenderParams params = readParamsAtTime(p_Args.time);
     std::unique_ptr<OFX::Image> dst(m_DstClip->fetchImage(p_Args.time));
     if (!dst) {
         OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -408,9 +746,34 @@ void BetterMotionBlurPlugin::render(const OFX::RenderArguments& p_Args)
     }
 
     const int currFrame = static_cast<int>(std::llround(p_Args.time));
-    const int lookback = (params.mode == bmb::eModeLongExposureTrail || params.mode == bmb::eModeCombined)
-                             ? std::max(1, params.trailFrames - 1)
-                             : 1;
+    int lookback = (params.mode == bmb::eModeLongExposureTrail || params.mode == bmb::eModeCombined)
+                       ? std::max(1, params.trailFrames - 1)
+                       : 1;
+    int maxOffset = (params.mode != bmb::eModeLongExposureTrail || params.viewMode != bmb::eViewFinal) ? 1 : 0;
+
+    double tlFps = 24.0, clFps = 24.0;
+    queryFrameRates(tlFps, clFps);
+    const bool shutterActive = (params.viewMode == bmb::eViewFinal) &&
+                               (params.mode == bmb::eModeShutterBlur || params.mode == bmb::eModeCombined);
+    const bool trailActive = (params.viewMode == bmb::eViewFinal) &&
+                             (params.mode == bmb::eModeLongExposureTrail || params.mode == bmb::eModeCombined);
+    const bool probePulldown = (shutterActive || trailActive) && (tlFps > clFps * 1.05);
+    const bool trySubFrameProbe = (shutterActive || trailActive) && (clFps > tlFps * 1.05);
+
+    if (probePulldown) {
+        int maxPull = std::clamp(static_cast<int>(std::ceil(tlFps / clFps)), 1, 4);
+        if (trailActive) {
+            lookback = (params.trailTimebase == bmb::eTimebaseClipFps)
+                           ? std::min(60, static_cast<int>(std::ceil((params.trailFrames - 1) * (tlFps / clFps))) + maxPull)
+                           : std::min(60, lookback + maxPull);
+        } else {
+            lookback = std::max(lookback, maxPull);
+        }
+        if (shutterActive) maxOffset = std::max(maxOffset, maxPull);
+    } else if (trailActive && clFps > tlFps * 1.05 && params.trailTimebase == bmb::eTimebaseClipFps) {
+        int scaled = std::clamp(static_cast<int>(std::lround(1.0 + (params.trailFrames - 1) * (tlFps / clFps))), 2, 24);
+        lookback = std::max(1, scaled - 1);
+    }
 
     std::vector<std::unique_ptr<OFX::Image>> srcImages;
     std::vector<std::unique_ptr<OFX::Image>> matteImages;
@@ -418,8 +781,6 @@ void BetterMotionBlurPlugin::render(const OFX::RenderArguments& p_Args)
     int centerIdx = -1;
 
     const bool useMatte = (m_MatteClip && m_MatteClip->isConnected() && params.matteMode != bmb::eMatteIgnore);
-
-    const int maxOffset = (params.mode != bmb::eModeLongExposureTrail || params.viewMode != bmb::eViewFinal) ? 1 : 0;
 
     for (int offset = -lookback; offset <= maxOffset; ++offset) {
         double sampleTime = p_Args.time + static_cast<double>(offset);
@@ -449,11 +810,100 @@ void BetterMotionBlurPlugin::render(const OFX::RenderArguments& p_Args)
         return;
     }
 
+    // Fractional sub-frame probing when high-FPS clip is on a lower-FPS timeline
+    std::vector<std::unique_ptr<OFX::Image>> subImages;
+    std::vector<std::unique_ptr<OFX::Image>> subMatteImages;
+    std::vector<int> subFrameIndices;
+    std::vector<float> subRelTimes;
+    std::vector<std::unique_ptr<OFX::Image>> trailSubImages;
+    std::vector<std::unique_ptr<OFX::Image>> trailSubMatteImages;
+    std::vector<int> trailSubFrameIndices;
+    float trailPairTimeStep = 1.0f;
+
+    if (trySubFrameProbe) {
+        double subStep = std::clamp(tlFps / clFps, 1.0 / 16.0, 0.95);
+        const std::string& currUid = srcImages[centerIdx]->getUniqueIdentifier();
+        if (shutterActive) {
+            std::unique_ptr<OFX::Image> probeImg(m_SrcClip->fetchImage(p_Args.time + subStep));
+            bool hostSupportsSubFrames = probeImg &&
+                                         (probeImg->getUniqueIdentifier().empty() ||
+                                          currUid.empty() ||
+                                          probeImg->getUniqueIdentifier() != currUid);
+            if (hostSupportsSubFrames) {
+                double effSpan = (params.shutterAngle / 360.0) * params.timebaseScale;
+                double effPhase = (params.shutterPhase / 360.0) * params.timebaseScale;
+                double tauMin = effPhase - 0.5 * effSpan;
+                double tauMax = effPhase + 0.5 * effSpan;
+                int kMin = std::max(-4, static_cast<int>(std::floor(tauMin / subStep)) - 1);
+                int kMax = std::min(4, static_cast<int>(std::ceil(tauMax / subStep)) + 1);
+                while (kMax - kMin + 1 > 9) {
+                    if (-kMin > kMax) ++kMin;
+                    else --kMax;
+                }
+                for (int k = kMin; k <= kMax; ++k) {
+                    double relT = static_cast<double>(k) * subStep;
+                    std::unique_ptr<OFX::Image> sfImg = (k == 1)
+                        ? std::move(probeImg)
+                        : std::unique_ptr<OFX::Image>(m_SrcClip->fetchImage(p_Args.time + relT));
+                    if (!sfImg) continue;
+                    subImages.push_back(std::move(sfImg));
+                    subFrameIndices.push_back(currFrame * 16 + k);
+                    subRelTimes.push_back(static_cast<float>(relT));
+                    if (useMatte) {
+                        subMatteImages.push_back(std::unique_ptr<OFX::Image>(m_MatteClip->fetchImage(p_Args.time + relT)));
+                    } else {
+                        subMatteImages.push_back(nullptr);
+                    }
+                }
+            }
+        }
+        if (trailActive) {
+            std::unique_ptr<OFX::Image> backProbe(m_SrcClip->fetchImage(p_Args.time - subStep));
+            bool hostSupportsTrailSub = backProbe &&
+                                        (backProbe->getUniqueIdentifier().empty() ||
+                                         currUid.empty() ||
+                                         backProbe->getUniqueIdentifier() != currUid);
+            if (hostSupportsTrailSub) {
+                int numSub = 2;
+                double step = subStep;
+                if (params.trailTimebase == bmb::eTimebaseClipFps) {
+                    numSub = std::clamp(params.trailFrames, 2, 24);
+                    trailPairTimeStep = 1.0f;
+                } else {
+                    int winTl = std::max(1, params.trailFrames - 1);
+                    int rawN = static_cast<int>(std::ceil(static_cast<double>(winTl) / subStep)) + 1;
+                    int stride = std::max(1, static_cast<int>(std::ceil(static_cast<double>(rawN - 1) / 24.0)));
+                    step = subStep * static_cast<double>(stride);
+                    numSub = std::clamp(static_cast<int>(std::llround(static_cast<double>(winTl) / step)) + 1, 2, 25);
+                    trailPairTimeStep = static_cast<float>(step);
+                }
+                for (int m = numSub - 1; m >= 0; --m) {
+                    double sampleTime = p_Args.time - static_cast<double>(m) * step;
+                    std::unique_ptr<OFX::Image> tfImg = (m == 1 && std::fabs(step - subStep) < 1e-6 && backProbe)
+                        ? std::move(backProbe)
+                        : std::unique_ptr<OFX::Image>(m_SrcClip->fetchImage(sampleTime));
+                    if (!tfImg) continue;
+                    trailSubImages.push_back(std::move(tfImg));
+                    trailSubFrameIndices.push_back(static_cast<int>(std::llround(sampleTime * 1000.0)));
+                    if (useMatte) {
+                        trailSubMatteImages.push_back(std::unique_ptr<OFX::Image>(m_MatteClip->fetchImage(sampleTime)));
+                    } else {
+                        trailSubMatteImages.push_back(nullptr);
+                    }
+                }
+            } else if (params.trailTimebase == bmb::eTimebaseClipFps) {
+                params.trailFrames = std::clamp(static_cast<int>(std::lround(1.0 + (params.trailFrames - 1) * (tlFps / clFps))), 2, 24);
+            }
+        }
+    }
+
     BetterMotionBlurProcessor proc(*this);
     proc.setDstImg(dst.get());
     proc.setGPURenderArgs(p_Args);
     proc.setRenderWindow(p_Args.renderWindow);
-    proc.setInputFrames(this, std::move(srcImages), std::move(matteImages), std::move(frameIndices), centerIdx, params);
+    proc.setInputFrames(this, std::move(srcImages), std::move(matteImages), std::move(frameIndices), centerIdx, params,
+                        probePulldown, std::move(subImages), std::move(subMatteImages), std::move(subFrameIndices), std::move(subRelTimes),
+                        std::move(trailSubImages), std::move(trailSubMatteImages), std::move(trailSubFrameIndices), trailPairTimeStep);
     proc.process();
 }
 
@@ -616,6 +1066,16 @@ void BetterMotionBlurPluginFactory::describeInContext(OFX::ImageEffectDescriptor
 
     page->addChild(*defDouble(p_Desc, kParamShutterAngle, "Shutter Angle (deg)", "Virtual camera shutter angle (180 = standard cinema)", 180.0, 0.0, 720.0, 0.0, 360.0, gShutter));
     page->addChild(*defDouble(p_Desc, kParamShutterPhase, "Shutter Phase (deg)", "Shutter temporal center offset", 0.0, -180.0, 180.0, -180.0, 180.0, gShutter));
+
+    OFX::ChoiceParamDescriptor* timebaseParam = p_Desc.defineChoiceParam(kParamShutterTimebase);
+    timebaseParam->setLabels("Shutter Timebase", "Shutter Timebase", "Shutter Timebase");
+    timebaseParam->setScriptName(kParamShutterTimebase);
+    timebaseParam->appendOption("Timeline FPS", "Reference shutter angle to timeline frame interval");
+    timebaseParam->appendOption("Source Clip FPS", "Scale shutter angle to unmapped source clip frame interval");
+    timebaseParam->setDefault(0);
+    timebaseParam->setParent(*gShutter);
+    page->addChild(*timebaseParam);
+
     page->addChild(*defBool(p_Desc, kParamAutoShutterSamples, "Auto Shutter Samples", "Adapt sample count per 16x16 tile from optical flow speed (uses Shutter Samples as max cap)", true, gShutter));
     page->addChild(*defInt(p_Desc, kParamShutterSamples, "Shutter Samples", "Sub-frame integration samples (acts as upper cap when Auto Shutter Samples is enabled)", 48, 8, 64, 8, 64, gShutter));
 
@@ -625,6 +1085,16 @@ void BetterMotionBlurPluginFactory::describeInContext(OFX::ImageEffectDescriptor
     page->addChild(*gTrail);
 
     page->addChild(*defInt(p_Desc, kParamTrailFrames, "Trail Length (Frames)", "Lookback temporal window for long exposure", 8, 2, 24, 2, 24, gTrail));
+
+    OFX::ChoiceParamDescriptor* trailTbParam = p_Desc.defineChoiceParam(kParamTrailTimebase);
+    trailTbParam->setLabels("Trail Timebase", "Trail Timebase", "Trail Timebase");
+    trailTbParam->setScriptName(kParamTrailTimebase);
+    trailTbParam->appendOption("Timeline FPS", "Count Trail Length in timeline frames");
+    trailTbParam->appendOption("Source Clip FPS", "Count Trail Length in distinct source clip frames");
+    trailTbParam->setDefault(0);
+    trailTbParam->setParent(*gTrail);
+    page->addChild(*trailTbParam);
+
     page->addChild(*defInt(p_Desc, kParamSubFrameSteps, "Sub-Frame Steps", "Flow-bridged steps between consecutive frames (eliminates stepping)", 6, 1, 16, 1, 12, gTrail));
 
     OFX::ChoiceParamDescriptor* blendParam = p_Desc.defineChoiceParam(kParamTrailBlendMode);

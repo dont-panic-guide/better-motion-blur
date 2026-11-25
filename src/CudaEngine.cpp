@@ -456,7 +456,7 @@ __global__ void patchMatchLKFlowKernel(
     // Exhaustive 2D local search around base flow at coarse levels
     if (searchRadius > 0) {
         float2 base = bestFlow;
-        float regW = (searchRadius >= 2) ? 1.0e-4f : 0.0f;
+        float regW = (searchRadius >= 2) ? 8.0e-5f : 0.0f;
         float bestScore = bestCost + regW * (base.x * base.x + base.y * base.y);
         for (int dy = -searchRadius; dy <= searchRadius; ++dy) {
             for (int dx = -searchRadius; dx <= searchRadius; ++dx) {
@@ -602,25 +602,44 @@ __global__ void correlationFlowKernel(
     const int axList[3] = {xm, x, xp};
     const int ayList[3] = {ym, y, yp};
 
+    auto eval3x3Err = [&](float sx, float sy, float cutoff) {
+        float err = 0.0f;
+        for (int py = 0; py < 3; ++py) {
+            float by = (float)ayList[py] + sy;
+            int base = py * 3;
+            for (int px = 0; px < 3; ++px) {
+                float b = sampleFloat1_Bilinear(lumaB, w, h, (float)axList[px] + sx, by);
+                err += fabsf(aPatch[base + px] - b);
+            }
+            if (err >= cutoff) return 1e9f;
+        }
+        return err;
+    };
+
     for (int dy = -2; dy <= 2; ++dy) {
         for (int dx = -2; dx <= 2; ++dx) {
             float sx = cur.x + (float)dx * 0.5f;
             float sy = cur.y + (float)dy * 0.5f;
-            float err = 0.0f;
-            for (int py = 0; py < 3; ++py) {
-                float by = (float)ayList[py] + sy;
-                int base = py * 3;
-                for (int px = 0; px < 3; ++px) {
-                    float b = sampleFloat1_Bilinear(lumaB, w, h, (float)axList[px] + sx, by);
-                    err += fabsf(aPatch[base + px] - b);
-                }
-                if (err >= bestScore) break;
-            }
+            float err = eval3x3Err(sx, sy, bestScore);
             if (err < bestScore) {
                 bestScore = err;
                 bestDelta = make_float2(sx, sy);
             }
         }
+    }
+
+    // Sub-pixel 1D parabolic refinement using 4 cardinal half-pixel neighbors
+    float cL = eval3x3Err(bestDelta.x - 0.5f, bestDelta.y, 1e9f);
+    float cR = eval3x3Err(bestDelta.x + 0.5f, bestDelta.y, 1e9f);
+    float denomX = cL - 2.0f * bestScore + cR;
+    if (denomX > 1e-5f) {
+        bestDelta.x += 0.5f * clampf(0.5f * (cL - cR) / denomX, -0.5f, 0.5f);
+    }
+    float cU = eval3x3Err(bestDelta.x, bestDelta.y - 0.5f, 1e9f);
+    float cD = eval3x3Err(bestDelta.x, bestDelta.y + 0.5f, 1e9f);
+    float denomY = cU - 2.0f * bestScore + cD;
+    if (denomY > 1e-5f) {
+        bestDelta.y += 0.5f * clampf(0.5f * (cU - cD) / denomY, -0.5f, 0.5f);
     }
 
     outFlow[idx] = bestDelta;
@@ -809,16 +828,104 @@ __global__ void packBidirectionalKernel(
     outConf2[idx] = make_uchar2(cF, cB);
 }
 
+__global__ void compareFramesKernel(
+    int w, int h, const float* rgbaA, const float* rgbaB, int* outDiffFlag)
+{
+    int tid = (int)threadIdx.x;
+    int gx = tid & 15;
+    int gy = tid >> 4;
+    int sx = (int)(((long long)gx * (long long)w) / 16 + (w / 32));
+    int sy = (int)(((long long)gy * (long long)h) / 16 + (h / 32));
+    sx = clampi(sx, 0, w - 1);
+    sy = clampi(sy, 0, h - 1);
+    const float4* a4 = (const float4*)rgbaA;
+    const float4* b4 = (const float4*)rgbaB;
+    float4 a = __ldg(&a4[sy * w + sx]);
+    float4 b = __ldg(&b4[sy * w + sx]);
+    int diff = (fabsf(a.x - b.x) + fabsf(a.y - b.y) + fabsf(a.z - b.z) > 3e-4f) ? 1 : 0;
+    int anyDiff = __syncthreads_or(diff);
+    if (tid == 0) {
+        *outDiffFlag = anyDiff ? 1 : 0;
+    }
+}
+
+__global__ void accumLinearFromDwiKernel(
+    int w, int h, const float* srcDwiRGBA, float weight, int isFirst, float* accumLinRGBA)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int idx = y * w + x;
+    const float4* src4 = (const float4*)srcDwiRGBA;
+    float4* acc4 = (float4*)accumLinRGBA;
+    float4 p = __ldg(&src4[idx]);
+    float lr = dwiToLinearChannel(p.x) * weight;
+    float lg = dwiToLinearChannel(p.y) * weight;
+    float lb = dwiToLinearChannel(p.z) * weight;
+    float la = p.w * weight;
+    if (isFirst) {
+        acc4[idx] = make_float4(lr, lg, lb, la);
+    } else {
+        float4 cur = acc4[idx];
+        acc4[idx] = make_float4(cur.x + lr, cur.y + lg, cur.z + lb, cur.w + la);
+    }
+}
+
+__global__ void encodeLinearToDwiKernel(
+    int w, int h, const float* accumLinRGBA, float invTotalW, float* dstDwiRGBA)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int idx = y * w + x;
+    const float4* acc4 = (const float4*)accumLinRGBA;
+    float4* dst4 = (float4*)dstDwiRGBA;
+    float4 c = __ldg(&acc4[idx]);
+    float r = linearToDwiChannel(c.x * invTotalW);
+    float g = linearToDwiChannel(c.y * invTotalW);
+    float b = linearToDwiChannel(c.z * invTotalW);
+    float a = clampf(c.w * invTotalW, 0.0f, 1.0f);
+    dst4[idx] = make_float4(r, g, b, a);
+}
+
+__device__ __forceinline__ void evalConfWeightedVelAcc(
+    int idx,
+    const uint2* flowFwd, int fwdRev, const uchar2* confFwd, float dtInvFwd,
+    const uint2* flowBwd, int bwdRev, const uchar2* confBwd, float dtInvBwd,
+    float sensitivity,
+    float2& outV0, float2& outA0)
+{
+    float2 vf = flowFwd ? readFlowVec(flowFwd, idx, fwdRev) : make_float2(0.0f, 0.0f);
+    float2 vb = flowBwd ? readFlowVec(flowBwd, idx, bwdRev) : make_float2(0.0f, 0.0f);
+    vf.x *= dtInvFwd * sensitivity; vf.y *= dtInvFwd * sensitivity;
+    vb.x *= dtInvBwd * sensitivity; vb.y *= dtInvBwd * sensitivity;
+
+    float cf = (flowFwd && confFwd) ? readConfVal(confFwd, idx, fwdRev) : (flowFwd ? 1.0f : 0.0f);
+    float cb = (flowBwd && confBwd) ? readConfVal(confBwd, idx, bwdRev) : (flowBwd ? 1.0f : 0.0f);
+    float wf = flowFwd ? (cf * cf + 0.02f) : 0.0f;
+    float wb = flowBwd ? (cb * cb + 0.02f) : 0.0f;
+    float wSum = fmaxf(1e-5f, wf + wb);
+
+    outV0 = make_float2((wf * vf.x - wb * vb.x) / wSum,
+                        (wf * vf.y - wb * vb.y) / wSum);
+
+    float accGate = (flowFwd && flowBwd) ? (fminf(cf, cb) * fminf(cf, cb)) : 0.0f;
+    float dtF = (dtInvFwd > 1e-4f) ? (1.0f / dtInvFwd) : 1.0f;
+    float dtB = (dtInvBwd > 1e-4f) ? (1.0f / dtInvBwd) : 1.0f;
+    float accScale = (2.0f / fmaxf(1e-4f, dtF + dtB)) * accGate;
+    outA0 = make_float2((vf.x + vb.x) * accScale, (vf.y + vb.y) * accScale);
+}
+
 // Coalesced 16x16 block-per-tile shared-memory parallel reduction
 __global__ void tileMaxVelKernel(
     int w, int h, int tileW, int tileH, int tileSize,
-    const uint2* flowFwd, int fwdRev,
-    const uint2* flowBwd, int bwdRev,
+    const uint2* flowFwd, int fwdRev, const uchar2* confFwd, float dtInvFwd,
+    const uint2* flowBwd, int bwdRev, const uchar2* confBwd, float dtInvBwd,
     float sensitivity, float threshold,
-    float2* tileMax)
+    float4* tileMax)
 {
     __shared__ float sMag[256];
-    __shared__ float2 sVel[256];
+    __shared__ float4 sVel[256];
 
     int tx = blockIdx.x;
     int ty = blockIdx.y;
@@ -827,19 +934,17 @@ __global__ void tileMaxVelKernel(
     int tid = threadIdx.y * 16 + threadIdx.x;
 
     float mag = 0.0f;
-    float2 vel = make_float2(0.0f, 0.0f);
+    float4 vel = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (x < w && y < h) {
         int idx = y * w + x;
-        float2 vf = flowFwd ? readFlowVec(flowFwd, idx, fwdRev) : make_float2(0.0f, 0.0f);
-        float2 vb = flowBwd ? readFlowVec(flowBwd, idx, bwdRev) : make_float2(0.0f, 0.0f);
-        if (!flowFwd && flowBwd) { vf = make_float2(-vb.x, -vb.y); }
-        if (!flowBwd && flowFwd) { vb = make_float2(-vf.x, -vf.y); }
-        float2 v0 = make_float2(0.5f * (vf.x - vb.x) * sensitivity, 0.5f * (vf.y - vb.y) * sensitivity);
+        float2 v0, a0;
+        evalConfWeightedVelAcc(idx, flowFwd, fwdRev, confFwd, dtInvFwd,
+                               flowBwd, bwdRev, confBwd, dtInvBwd, sensitivity, v0, a0);
         float m = hypotf(v0.x, v0.y);
         if (m > threshold) {
             float gate = smoothstepf(threshold, threshold + 0.75f, m);
             mag = m * gate;
-            vel = make_float2(v0.x * gate, v0.y * gate);
+            vel = make_float4(v0.x * gate, v0.y * gate, a0.x * gate, a0.y * gate);
         }
     }
 
@@ -860,42 +965,60 @@ __global__ void tileMaxVelKernel(
     }
 }
 
-__global__ void neighborMaxVelKernel(
-    int tileW, int tileH, const float2* tileMax, float2* neighborMax)
+__global__ void neighborMaxVelHKernel(
+    int tileW, int tileH, int tileRadius, const float4* tileMax, float4* tmpMax)
 {
     int tx = blockIdx.x * blockDim.x + threadIdx.x;
     int ty = blockIdx.y * blockDim.y + threadIdx.y;
     if (tx >= tileW || ty >= tileH) return;
 
-    float bestMag = 0.0f;
-    float2 bestVel = make_float2(0.0f, 0.0f);
-
-    for (int dy = -1; dy <= 1; ++dy) {
-        int ny = clampi(ty + dy, 0, tileH - 1);
-        for (int dx = -1; dx <= 1; ++dx) {
-            int nx = clampi(tx + dx, 0, tileW - 1);
-            float2 v = tileMax[ny * tileW + nx];
-            float m = hypotf(v.x, v.y);
-            if (m > bestMag) {
-                bestMag = m;
-                bestVel = v;
-            }
+    float bestMagSq = 0.0f;
+    float4 bestVel = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int x0 = max(0, tx - tileRadius);
+    int x1 = min(tileW - 1, tx + tileRadius);
+    int row = ty * tileW;
+    for (int nx = x0; nx <= x1; ++nx) {
+        float4 v = __ldg(&tileMax[row + nx]);
+        float m2 = v.x * v.x + v.y * v.y;
+        if (m2 > bestMagSq) {
+            bestMagSq = m2;
+            bestVel = v;
         }
     }
+    tmpMax[row + tx] = bestVel;
+}
 
+__global__ void neighborMaxVelVKernel(
+    int tileW, int tileH, int tileRadius, const float4* tmpMax, float4* neighborMax)
+{
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    if (tx >= tileW || ty >= tileH) return;
+
+    float bestMagSq = 0.0f;
+    float4 bestVel = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int y0 = max(0, ty - tileRadius);
+    int y1 = min(tileH - 1, ty + tileRadius);
+    for (int ny = y0; ny <= y1; ++ny) {
+        float4 v = __ldg(&tmpMax[ny * tileW + tx]);
+        float m2 = v.x * v.x + v.y * v.y;
+        if (m2 > bestMagSq) {
+            bestMagSq = m2;
+            bestVel = v;
+        }
+    }
     neighborMax[ty * tileW + tx] = bestVel;
 }
 
 __global__ void synthesizeShutterBlurKernel(
     int w, int h, int tileW, int tileH, int tileSize,
-    const float* srcRGBA,
-    const uint2* flowFwd, int fwdRev, // (t->t+1)
-    const uint2* flowBwd, int bwdRev, // (t->t-1)
-    const uchar2* conf2,
-    const float2* neighborMax,
-    const float* matteTex,
-    int hasMatte, int matteMode,
-    float shutterAngle, float shutterPhase, int samples, int autoSamples,
+    const float* srcRGBA, const float* prevRGBA, const float* nextRGBA,
+    const uint2* flowFwd, int fwdRev, const uchar2* confFwd, float dtInvFwd,
+    const uint2* flowBwd, int bwdRev, const uchar2* confBwd, float dtInvBwd,
+    const float4* neighborMax,
+    const float* matteTex, const float* prevMatte, int prevMatteComp,
+    const float* nextMatte, int nextMatteComp, int hasMatte, int matteMode,
+    float shutterSpan, float phaseCenter, int samples, int autoSamples,
     float sensitivity, float threshold,
     float highlightBoost,
     float* dstRGBA)
@@ -915,16 +1038,9 @@ __global__ void synthesizeShutterBlurKernel(
         return;
     }
 
-    float2 vf = flowFwd ? readFlowVec(flowFwd, idx, fwdRev) : make_float2(0.0f, 0.0f);
-    float2 vb = flowBwd ? readFlowVec(flowBwd, idx, bwdRev) : make_float2(0.0f, 0.0f);
-    if (!flowFwd && flowBwd) { vf = make_float2(-vb.x, -vb.y); }
-    if (!flowBwd && flowFwd) { vb = make_float2(-vf.x, -vf.y); }
-
-    vf.x *= sensitivity; vf.y *= sensitivity;
-    vb.x *= sensitivity; vb.y *= sensitivity;
-
-    float2 v0 = make_float2(0.5f * (vf.x - vb.x), 0.5f * (vf.y - vb.y));
-    float2 a0 = make_float2(vf.x + vb.x, vf.y + vb.y);
+    float2 v0, a0;
+    evalConfWeightedVelAcc(idx, flowFwd, fwdRev, confFwd, dtInvFwd,
+                           flowBwd, bwdRev, confBwd, dtInvBwd, sensitivity, v0, a0);
 
     float centerSpeed = hypotf(v0.x, v0.y);
     float centerGate = smoothstepf(threshold, threshold + 0.75f, centerSpeed);
@@ -934,124 +1050,270 @@ __global__ void synthesizeShutterBlurKernel(
 
     int tx = min(tileW - 1, x / tileSize);
     int ty = min(tileH - 1, y / tileSize);
-    float2 vDom = __ldg(&neighborMax[ty * tileW + tx]);
+    float4 domVA = __ldg(&neighborMax[ty * tileW + tx]);
+    float2 vDom = make_float2(domVA.x, domVA.y);
+    float2 aDom = make_float2(domVA.z, domVA.w);
     float domSpeed = hypotf(vDom.x, vDom.y);
-
-    float shutterSpan = shutterAngle / 360.0f;
-    float halfSpan = 0.5f * shutterSpan;
-    float phaseCenter = shutterPhase / 360.0f;
 
     if (fmaxf(centerSpeed, domSpeed) * shutterSpan < 0.25f) {
         dst4[idx] = centerP;
         return;
     }
 
+    const float tauMin = phaseCenter - 0.5f * shutterSpan;
+    const float tauMax = phaseCenter + 0.5f * shutterSpan;
+
+    float3 centerLin = make_float3(dwiToLinearChannel(centerP.x),
+                                   dwiToLinearChannel(centerP.y),
+                                   dwiToLinearChannel(centerP.z));
+    float centerHdrW = 1.0f;
+    if (highlightBoost > 0.0f) {
+        float cl = dwgLuminance(centerLin.x, centerLin.y, centerLin.z);
+        if (cl > 0.8f) {
+            float ex = cl - 0.8f;
+            centerHdrW += highlightBoost * ex * sqrtf(ex);
+        }
+    }
+
+    // Zero-cost neighbor velocities at (x, y) for disocclusion resolution
+    float2 vAtNext = flowFwd ? readFlowVec(flowFwd, idx, 1 - fwdRev) : make_float2(0.0f, 0.0f);
+    vAtNext.x *= dtInvFwd * sensitivity; vAtNext.y *= dtInvFwd * sensitivity;
+    float nextSpeedAtX = hypotf(vAtNext.x, vAtNext.y);
+
+    float2 vAtPrev = flowBwd ? readFlowVec(flowBwd, idx, 1 - bwdRev) : make_float2(0.0f, 0.0f);
+    vAtPrev.x *= dtInvBwd * sensitivity; vAtPrev.y *= dtInvBwd * sensitivity;
+    float prevSpeedAtX = hypotf(vAtPrev.x, vAtPrev.y);
+
+    const bool matteIso = (hasMatte && matteMode == 1);
+    float mPrevAtX = (matteIso && prevMatte) ? readMatteVal(prevMatte, idx, prevMatteComp) : 0.0f;
+    float mNextAtX = (matteIso && nextMatte) ? readMatteVal(nextMatte, idx, nextMatteComp) : 0.0f;
+
+    const bool centerIsBg = matteIso ? (mCenter < 0.5f) : (centerSpeed < 0.35f * domSpeed);
+    const bool useDomAll = (domSpeed > centerSpeed + 0.75f) && centerIsBg;
+    const bool boundaryMix = !matteIso && !useDomAll && (domSpeed > centerSpeed + 1.5f) && (centerSpeed < 0.75f * domSpeed);
+
     // Interleaved hash jitter for banding-free temporal integration
     float jRaw = (float)(((x * 73856093) ^ (y * 19349663)) & 0xFFFF) * (1.0f / 65536.0f);
     float jitter = jRaw - 0.5f;
 
-    float3 accumRGB = make_float3(0.0f, 0.0f, 0.0f);
-    float accumA = 0.0f;
-    float accumAlphaW = 0.0f;
-    float accumW = 0.0f;
-
-    float fgCenter = (hasMatte && matteMode == 1) ? mCenter : (centerSpeed > 0.35f * domSpeed ? 1.0f : 0.0f);
-    const bool useDom = (domSpeed > centerSpeed + 0.75f) && (fgCenter < 0.5f);
-    const bool matteIso = (hasMatte && matteMode == 1);
     int effSamples = samples;
     if (autoSamples) {
         int minS = min(samples, 8);
-        int adaptive = (int)ceilf(domSpeed * shutterSpan * 1.25f);
+        int adaptive = (int)ceilf(fmaxf(centerSpeed, domSpeed) * shutterSpan * 1.25f);
         effSamples = clampi(adaptive, minS, samples);
     }
     const float invSamples = 1.0f / (float)effSamples;
     const float jOffset = 0.5f + 0.35f * jitter;
 
+    float3 fgRGB = make_float3(0.0f, 0.0f, 0.0f);
+    float fgA = 0.0f, fgRgbW = 0.0f, fgTime = 0.0f;
+    float3 bgRGB = make_float3(0.0f, 0.0f, 0.0f);
+    float bgA = 0.0f, bgRgbW = 0.0f, bgTime = 0.0f;
+
     for (int i = 0; i < effSamples; ++i) {
         float u = ((float)i + jOffset) * invSamples;
         float tau = phaseCenter + (u - 0.5f) * shutterSpan;
+        bool tapUseDom = useDomAll || (boundaryMix && ((i & 1) == 1));
 
         float2 disp;
-        if (useDom) {
-            disp = make_float2(vDom.x * tau, vDom.y * tau);
+        float halfTau2 = 0.5f * tau * tau;
+        if (tapUseDom) {
+            disp = make_float2(-vDom.x * tau - aDom.x * halfTau2,
+                               -vDom.y * tau - aDom.y * halfTau2);
         } else {
-            float halfTau2 = 0.5f * tau * tau;
-            disp = make_float2(v0.x * tau + a0.x * halfTau2,
-                               v0.y * tau + a0.y * halfTau2);
+            disp = make_float2(-v0.x * tau - a0.x * halfTau2,
+                               -v0.y * tau - a0.y * halfTau2);
         }
 
         float sx = (float)x + disp.x;
         float sy = (float)y + disp.y;
-
         int isx = clampi((int)roundf(sx), 0, w - 1);
         int isy = clampi((int)roundf(sy), 0, h - 1);
         int sIdx = isy * w + isx;
 
-        float wSample = 1.0f;
+        if (tapUseDom) {
+            float2 sVel, sAcc;
+            evalConfWeightedVelAcc(sIdx, flowFwd, fwdRev, confFwd, dtInvFwd,
+                                   flowBwd, bwdRev, confBwd, dtInvBwd, sensitivity, sVel, sAcc);
+            float sSpeed = hypotf(sVel.x, sVel.y);
+            bool candFg = matteIso
+                ? (matteTex && __ldg(&matteTex[sIdx]) >= 0.5f && sSpeed > 0.25f)
+                : (sSpeed > centerSpeed + 0.75f && sSpeed > 0.25f * domSpeed);
 
-        if (matteIso) {
-            float sMatte = matteTex ? __ldg(&matteTex[sIdx]) : 1.0f;
-            if (mCenter >= 0.5f) {
-                if (sMatte < 0.5f) {
-                    wSample = 0.0f;
+            bool fgHit = false;
+            if (candFg) {
+                float dx = (float)x - sx;
+                float dy = (float)y - sy;
+                float v2 = fmaxf(1e-4f, sVel.x * sVel.x + sVel.y * sVel.y);
+                float tauStar = (dx * sVel.x + dy * sVel.y) / v2;
+                float epsTau = 0.75f / fmaxf(1.0f, sSpeed);
+                if (tauStar >= tauMin - epsTau && tauStar <= tauMax + epsTau) {
+                    float halfTauS2 = 0.5f * tauStar * tauStar;
+                    float pxErr = dx - tauStar * sVel.x - sAcc.x * halfTauS2;
+                    float pyErr = dy - tauStar * sVel.y - sAcc.y * halfTauS2;
+                    float perpDist = hypotf(pxErr, pyErr);
+                    float distToSample = hypotf(dx, dy);
+                    if (perpDist <= 1.5f + 0.15f * distToSample) {
+                        fgHit = true;
+                    }
                 }
-            } else if (sMatte >= 0.5f) {
-                float2 svf = flowFwd ? readFlowVec(flowFwd, sIdx, fwdRev) : make_float2(0.0f, 0.0f);
-                float2 svb = flowBwd ? readFlowVec(flowBwd, sIdx, bwdRev) : make_float2(0.0f, 0.0f);
-                if (!flowFwd && flowBwd) { svf = make_float2(-svb.x, -svb.y); }
-                if (!flowBwd && flowFwd) { svb = make_float2(-svf.x, -svf.y); }
-                float sSpeed = hypotf(0.5f * (svf.x - svb.x) * sensitivity, 0.5f * (svf.y - svb.y) * sensitivity);
-                float distToSample = hypotf(disp.x, disp.y);
-                float reach = sSpeed * halfSpan + 1.0f;
-                wSample = (distToSample <= reach) ? 1.0f : 0.0f;
             }
-        } else if (centerSpeed > 1.5f || useDom) {
-            float2 svf = flowFwd ? readFlowVec(flowFwd, sIdx, fwdRev) : make_float2(0.0f, 0.0f);
-            float2 svb = flowBwd ? readFlowVec(flowBwd, sIdx, bwdRev) : make_float2(0.0f, 0.0f);
-            if (!flowFwd && flowBwd) { svf = make_float2(-svb.x, -svb.y); }
-            if (!flowBwd && flowFwd) { svb = make_float2(-svf.x, -svf.y); }
-            float sSpeed = hypotf(0.5f * (svf.x - svb.x) * sensitivity, 0.5f * (svf.y - svb.y) * sensitivity);
-            if (centerSpeed > 1.5f && sSpeed < 0.35f * centerSpeed) {
-                wSample = 0.05f;
-            } else if (useDom) {
-                float distToSample = hypotf(disp.x, disp.y);
-                float reach = sSpeed * halfSpan + 1.0f;
-                wSample = (sSpeed > 0.4f * domSpeed && distToSample <= reach) ? 1.0f : 0.0f;
+
+            if (fgHit) {
+                float4 pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+                pix.x = dwiToLinearChannel(pix.x);
+                pix.y = dwiToLinearChannel(pix.y);
+                pix.z = dwiToLinearChannel(pix.z);
+                float hdrW = 1.0f;
+                if (highlightBoost > 0.0f) {
+                    float luma = dwgLuminance(pix.x, pix.y, pix.z);
+                    if (luma > 0.8f) {
+                        float ex = luma - 0.8f;
+                        hdrW += highlightBoost * ex * sqrtf(ex);
+                    }
+                }
+                float wJac = clampf(domSpeed / fmaxf(sSpeed, 1.0f), 1.0f, 2.5f);
+                float totW = wJac * hdrW;
+                fgRGB.x += totW * pix.x;
+                fgRGB.y += totW * pix.y;
+                fgRGB.z += totW * pix.z;
+                fgA += wJac * pix.w;
+                fgRgbW += totW;
+                fgTime += wJac;
+            } else {
+                if (centerSpeed > 0.5f) {
+                    float bx = (float)x - v0.x * tau;
+                    float by = (float)y - v0.y * tau;
+                    float4 pix = sampleRGBA_Bilinear(srcRGBA, w, h, bx, by);
+                    pix.x = dwiToLinearChannel(pix.x);
+                    pix.y = dwiToLinearChannel(pix.y);
+                    pix.z = dwiToLinearChannel(pix.z);
+                    float hdrW = 1.0f;
+                    if (highlightBoost > 0.0f) {
+                        float luma = dwgLuminance(pix.x, pix.y, pix.z);
+                        if (luma > 0.8f) {
+                            float ex = luma - 0.8f;
+                            hdrW += highlightBoost * ex * sqrtf(ex);
+                        }
+                    }
+                    bgRGB.x += hdrW * pix.x;
+                    bgRGB.y += hdrW * pix.y;
+                    bgRGB.z += hdrW * pix.z;
+                    bgA += pix.w;
+                    bgRgbW += hdrW;
+                } else {
+                    bgRGB.x += centerHdrW * centerLin.x;
+                    bgRGB.y += centerHdrW * centerLin.y;
+                    bgRGB.z += centerHdrW * centerLin.z;
+                    bgA += centerP.w;
+                    bgRgbW += centerHdrW;
+                }
+                bgTime += 1.0f;
             }
+        } else {
+            float4 pix;
+            float wSample = 1.0f;
+            bool steppedOff = false;
+            if (matteIso) {
+                float sMatte = matteTex ? __ldg(&matteTex[sIdx]) : 1.0f;
+                steppedOff = (mCenter >= 0.5f && sMatte < 0.5f);
+            } else if (centerSpeed > 1.5f) {
+                float2 sVel, sAcc;
+                evalConfWeightedVelAcc(sIdx, flowFwd, fwdRev, confFwd, dtInvFwd,
+                                       flowBwd, bwdRev, confBwd, dtInvBwd, sensitivity, sVel, sAcc);
+                float sSpeed = hypotf(sVel.x, sVel.y);
+                steppedOff = (sSpeed < 0.35f * centerSpeed);
+            }
+
+            if (steppedOff) {
+                bool usePrev = (tau < 0.0f);
+                bool uncovered = false;
+                if (usePrev) {
+                    uncovered = matteIso ? (prevMatte ? (mPrevAtX < 0.5f) : true)
+                                         : (flowBwd ? (prevSpeedAtX < 0.5f * centerSpeed) : true);
+                    if (uncovered && prevRGBA) {
+                        float dtStep = (dtInvBwd > 1e-4f) ? (1.0f / dtInvBwd) : 1.0f;
+                        float pSub = clampf(dtStep + tau, 0.0f, dtStep);
+                        pix = sampleRGBA_Bilinear(prevRGBA, w, h, (float)x - vAtPrev.x * pSub, (float)y - vAtPrev.y * pSub);
+                    } else if (uncovered) {
+                        pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+                    } else {
+                        if (matteIso) wSample = 0.0f;
+                        else {
+                            wSample = 0.05f;
+                            pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+                        }
+                    }
+                } else {
+                    uncovered = matteIso ? (nextMatte ? (mNextAtX < 0.5f) : true)
+                                         : (flowFwd ? (nextSpeedAtX < 0.5f * centerSpeed) : true);
+                    if (uncovered && nextRGBA) {
+                        float dtStep = (dtInvFwd > 1e-4f) ? (1.0f / dtInvFwd) : 1.0f;
+                        float nSub = clampf(dtStep - tau, 0.0f, dtStep);
+                        pix = sampleRGBA_Bilinear(nextRGBA, w, h, (float)x - vAtNext.x * nSub, (float)y - vAtNext.y * nSub);
+                    } else if (uncovered) {
+                        pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+                    } else {
+                        if (matteIso) wSample = 0.0f;
+                        else {
+                            wSample = 0.05f;
+                            pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+                        }
+                    }
+                }
+            } else {
+                pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
+            }
+
+            if (wSample <= 0.0f) continue;
+            pix.x = dwiToLinearChannel(pix.x);
+            pix.y = dwiToLinearChannel(pix.y);
+            pix.z = dwiToLinearChannel(pix.z);
+            float hdrW = 1.0f;
+            if (highlightBoost > 0.0f) {
+                float luma = dwgLuminance(pix.x, pix.y, pix.z);
+                if (luma > 0.8f) {
+                    float ex = luma - 0.8f;
+                    hdrW += highlightBoost * ex * sqrtf(ex);
+                }
+            }
+            float totW = wSample * hdrW;
+            fgRGB.x += totW * pix.x;
+            fgRGB.y += totW * pix.y;
+            fgRGB.z += totW * pix.z;
+            fgA += wSample * pix.w;
+            fgRgbW += totW;
+            fgTime += wSample;
         }
-
-        if (wSample <= 0.0f) continue;
-
-        float4 pix = sampleRGBA_Bilinear(srcRGBA, w, h, sx, sy);
-        pix.x = dwiToLinearChannel(pix.x);
-        pix.y = dwiToLinearChannel(pix.y);
-        pix.z = dwiToLinearChannel(pix.z);
-
-        float hdrW = 1.0f;
-        if (highlightBoost > 0.0f) {
-            float luma = dwgLuminance(pix.x, pix.y, pix.z);
-            if (luma > 0.8f) {
-                float ex = luma - 0.8f;
-                hdrW += highlightBoost * ex * sqrtf(ex);
-            }
-        }
-        float totW = wSample * hdrW;
-
-        accumRGB.x += totW * pix.x;
-        accumRGB.y += totW * pix.y;
-        accumRGB.z += totW * pix.z;
-        accumA += wSample * pix.w;
-        accumAlphaW += wSample;
-        accumW += totW;
     }
 
-    if (accumW < 1e-6f) {
+    float3 outRGB;
+    float outA;
+    if (fgTime < 1e-6f && bgTime < 1e-6f) {
         dst4[idx] = centerP;
         return;
+    } else if (fgTime > 1e-6f && bgTime > 1e-6f) {
+        float fgFrac = clampf(fgTime * invSamples, 0.0f, 1.0f);
+        float bgFrac = 1.0f - fgFrac;
+        float invFgW = 1.0f / fmaxf(1e-6f, fgRgbW);
+        float invBgW = 1.0f / fmaxf(1e-6f, bgRgbW);
+        float fgHdrAvg = fgRgbW / fmaxf(1e-6f, fgTime);
+        float bgHdrAvg = bgRgbW / fmaxf(1e-6f, bgTime);
+        float wFgBlend = fgFrac * fgHdrAvg;
+        float wBgBlend = bgFrac * bgHdrAvg;
+        float invBlend = 1.0f / fmaxf(1e-6f, wFgBlend + wBgBlend);
+        outRGB = make_float3(
+            (wFgBlend * (fgRGB.x * invFgW) + wBgBlend * (bgRGB.x * invBgW)) * invBlend,
+            (wFgBlend * (fgRGB.y * invFgW) + wBgBlend * (bgRGB.y * invBgW)) * invBlend,
+            (wFgBlend * (fgRGB.z * invFgW) + wBgBlend * (bgRGB.z * invBgW)) * invBlend);
+        outA = clampf(fgFrac * (fgA / fgTime) + bgFrac * (bgA / bgTime), 0.0f, 1.0f);
+    } else if (fgTime > 1e-6f) {
+        outRGB = make_float3(fgRGB.x / fgRgbW, fgRGB.y / fgRgbW, fgRGB.z / fgRgbW);
+        outA = clampf(fgA / fgTime, 0.0f, 1.0f);
+    } else {
+        outRGB = make_float3(bgRGB.x / bgRgbW, bgRGB.y / bgRgbW, bgRGB.z / bgRgbW);
+        outA = clampf(bgA / bgTime, 0.0f, 1.0f);
     }
-
-    float3 outRGB = make_float3(accumRGB.x / accumW, accumRGB.y / accumW, accumRGB.z / accumW);
-    float outA = clampf(accumA / fmaxf(1e-6f, accumAlphaW), 0.0f, 1.0f);
 
     outRGB.x = linearToDwiChannel(outRGB.x);
     outRGB.y = linearToDwiChannel(outRGB.y);
@@ -1139,7 +1401,7 @@ __global__ void trailPairInitStaticKernel(
     const float* frameA,
     const uint2* flow4, int flowRev,
     const float* matteA, int matteAComp, int hasMatte, int matteMode,
-    int pairAgeIndex, int subFrameSteps,
+    int pairAgeIndex, float pairTimeStep, int subFrameSteps,
     int blendMode, float trailDecay,
     float sensitivity, float motionThreshold, float lumaThreshold,
     float highlightBoost, int addToExisting,
@@ -1152,11 +1414,15 @@ __global__ void trailPairInitStaticKernel(
 
     if (x < w && y < h) {
         int idx = y * w + x;
-        float mVal = (hasMatte && matteMode == 2 && matteA && matteAComp > 0)
+        float mVal = (hasMatte && matteMode != 0 && matteA && matteAComp > 0)
                          ? readMatteVal(matteA, idx, matteAComp)
                          : 1.0f;
 
-        if (hasMatte && matteMode == 2 && mVal <= 0.001f) {
+        if (hasMatte && matteMode == 1 && mVal < 0.5f) {
+            if (!addToExisting) {
+                pairAccum[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        } else if (hasMatte && matteMode == 2 && mVal <= 0.001f) {
             if (blendMode != 1) {
                 const float4* frameA4 = (const float4*)frameA;
                 float4 pA = __ldg(&frameA4[idx]);
@@ -1164,7 +1430,7 @@ __global__ void trailPairInitStaticKernel(
                 float gA = dwiToLinearChannel(pA.y);
                 float bA = dwiToLinearChannel(pA.z);
                 float decayLambda = 0.25f + 3.2f * trailDecay;
-                float wBase = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+                float wBase = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex * pairTimeStep) : 1.0f;
                 if (addToExisting) {
                     float4 curAcc = pairAccum[idx];
                     curAcc.x += rA * wBase;
@@ -1214,9 +1480,10 @@ __global__ void trailPairInitStaticKernel(
                     }
                 } else if (subFrameSteps <= 1 || speed < 0.35f) {
                     float decayLambda = 0.25f + 3.2f * trailDecay;
-                    float timeW = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
+                    float timeW = (blendMode == 2 && pairAgeIndex > 0) ? expf(-decayLambda * (float)pairAgeIndex * pairTimeStep) : 1.0f;
+                    float fgW = (hasMatte && matteMode == 1) ? mVal : 1.0f;
                     if (blendMode == 1) {
-                        float gate = motionGate * lumaGate * timeW;
+                        float gate = motionGate * lumaGate * timeW * fgW;
                         float vr = fmaxf(0.0f, rA * gate);
                         float vg = fmaxf(0.0f, gA * gate);
                         float vb = fmaxf(0.0f, bA * gate);
@@ -1238,7 +1505,7 @@ __global__ void trailPairInitStaticKernel(
                                 hdrW += highlightBoost * ex * sqrtf(ex);
                             }
                         }
-                        float wTot = timeW * hdrW;
+                        float wTot = timeW * hdrW * fgW;
                         if (addToExisting) {
                             float4 curAcc = pairAccum[idx];
                             curAcc.x += rA * wTot;
@@ -1270,8 +1537,9 @@ __global__ void trailPairSplatMovingKernel(
     int w, int h,
     const float* frameA, const float* frameB,
     const uint2* flow4, const uchar2* conf2, int flowRev,
+    const uint2* nextFlow4, const uchar2* nextConf2, int nextFlowRev,
     const float* matteA, int matteAComp, int hasMatte, int matteMode,
-    int pairAgeIndex, int subFrameSteps,
+    int pairAgeIndex, float pairTimeStep, int subFrameSteps,
     int blendMode, float trailDecay,
     float sensitivity, float motionThreshold, float lumaThreshold,
     float highlightBoost,
@@ -1299,15 +1567,18 @@ __global__ void trailPairSplatMovingKernel(
     bool isActive = false;
     float2 fl = make_float2(0.0f, 0.0f);
     float vx = 0.0f, vy = 0.0f, speed = 0.0f;
+    float c1x = 0.0f, c1y = 0.0f, c2x = 0.0f, c2y = 0.0f;
     float rA = 0.0f, gA = 0.0f, bA = 0.0f;
-    float motionGate = 1.0f, lumaGate = 1.0f;
+    float motionGate = 1.0f, lumaGate = 1.0f, fgMatteW = 1.0f;
     int adaptiveSteps = 0;
 
     if (x < w && y < h && subFrameSteps > 1 && flow4) {
-        float mVal = (hasMatte && matteMode == 2 && matteA && matteAComp > 0)
+        float mVal = (hasMatte && matteMode != 0 && matteA && matteAComp > 0)
                          ? readMatteVal(matteA, idx, matteAComp)
                          : 1.0f;
-        if (!(hasMatte && matteMode == 2 && mVal <= 0.001f)) {
+        bool matteSkip = (hasMatte && ((matteMode == 2 && mVal <= 0.001f) || (matteMode == 1 && mVal < 0.5f)));
+        if (!matteSkip) {
+            if (hasMatte && matteMode == 1) fgMatteW = mVal;
             fl = readFlowVec(flow4, idx, flowRev);
             vx = fl.x * sensitivity;
             vy = fl.y * sensitivity;
@@ -1344,19 +1615,65 @@ __global__ void trailPairSplatMovingKernel(
 
     int txMin = w, txMax = -1, tyMin = h, tyMax = -1;
     if (isActive) {
-        adaptiveSteps = max(subFrameSteps, min(72, (int)ceilf(speed * 1.25f)));
+        c1x = vx; c1y = vy;
+        c2x = 0.0f; c2y = 0.0f;
+        if (nextFlow4) {
+            int bx = clampi((int)roundf((float)x + fl.x), 0, w - 1);
+            int by = clampi((int)roundf((float)y + fl.y), 0, h - 1);
+            int bIdx = by * w + bx;
+            float2 fl2 = readFlowVec(nextFlow4, bIdx, nextFlowRev);
+            float u2x = fl2.x * sensitivity;
+            float u2y = fl2.y * sensitivity;
+            float c1 = conf2 ? readConfVal(conf2, idx, flowRev) : 1.0f;
+            float c2 = nextConf2 ? readConfVal(nextConf2, bIdx, nextFlowRev) : 1.0f;
+            float gCurv = fminf(c1, c2);
+            gCurv *= gCurv;
+            float dux = u2x - vx;
+            float duy = u2y - vy;
+            float duLen = hypotf(dux, duy);
+            if (duLen > 1.5f * speed) {
+                float sc = (1.5f * speed) / fmaxf(1e-5f, duLen);
+                dux *= sc; duy *= sc;
+            }
+            float t1x = vx + 0.5f * gCurv * dux;
+            float t1y = vy + 0.5f * gCurv * duy;
+            c1x = 2.0f * vx - t1x;
+            c1y = 2.0f * vy - t1y;
+            c2x = t1x - vx;
+            c2y = t1y - vy;
+        }
+        float midX = (float)x + 0.5f * c1x + 0.25f * c2x;
+        float midY = (float)y + 0.5f * c1y + 0.25f * c2y;
+        float endX0 = (float)x + vx;
+        float endY0 = (float)y + vy;
+        float arcLen = hypotf(midX - (float)x, midY - (float)y) + hypotf(endX0 - midX, endY0 - midY);
+
+        adaptiveSteps = max(subFrameSteps, min(72, (int)ceilf(fmaxf(speed, arcLen) * 1.25f)));
         float invSteps = 1.0f / (float)adaptiveSteps;
         float alphaEnd = (float)(adaptiveSteps - 1) * invSteps;
-        float endX = (float)x + alphaEnd * vx;
-        float endY = (float)y + alphaEnd * vy;
-        float minPx = fminf((float)x, endX) - 0.01f;
-        float maxPx = fmaxf((float)x, endX) + 0.01f;
-        float minPy = fminf((float)y, endY) - 0.01f;
-        float maxPy = fmaxf((float)y, endY) + 0.01f;
-        txMin = clampi((int)floorf(minPx), 0, w - 1);
-        txMax = clampi((int)floorf(maxPx) + 1, 0, w - 1);
-        tyMin = clampi((int)floorf(minPy), 0, h - 1);
-        tyMax = clampi((int)floorf(maxPy) + 1, 0, h - 1);
+        float endX = (float)x + (c1x + c2x * alphaEnd) * alphaEnd;
+        float endY = (float)y + (c1y + c2y * alphaEnd) * alphaEnd;
+
+        float minPx = fminf((float)x, endX);
+        float maxPx = fmaxf((float)x, endX);
+        if (fabsf(c2x) > 1e-4f) {
+            float aStarX = clampf(-c1x / (2.0f * c2x), 0.0f, alphaEnd);
+            float extX = (float)x + (c1x + c2x * aStarX) * aStarX;
+            minPx = fminf(minPx, extX);
+            maxPx = fmaxf(maxPx, extX);
+        }
+        float minPy = fminf((float)y, endY);
+        float maxPy = fmaxf((float)y, endY);
+        if (fabsf(c2y) > 1e-4f) {
+            float aStarY = clampf(-c1y / (2.0f * c2y), 0.0f, alphaEnd);
+            float extY = (float)y + (c1y + c2y * aStarY) * aStarY;
+            minPy = fminf(minPy, extY);
+            maxPy = fmaxf(maxPy, extY);
+        }
+        txMin = clampi((int)floorf(minPx - 0.01f), 0, w - 1);
+        txMax = clampi((int)floorf(maxPx + 0.01f) + 1, 0, w - 1);
+        tyMin = clampi((int)floorf(minPy - 0.01f), 0, h - 1);
+        tyMax = clampi((int)floorf(maxPy + 0.01f) + 1, 0, h - 1);
     }
 
     const int lane = tid & 31;
@@ -1425,19 +1742,17 @@ __global__ void trailPairSplatMovingKernel(
         }
 
         const float invSteps = 1.0f / (float)adaptiveSteps;
-        const float stepVx = vx * invSteps;
-        const float stepVy = vy * invSteps;
         const float confStep = conf * invSteps;
         const float dr = (pB.x - rA) * confStep;
         const float dg = (pB.y - gA) * confStep;
         const float db = (pB.z - bA) * confStep;
 
         const float decayLambda = 0.25f + 3.2f * trailDecay;
-        float timeW = (blendMode == 2) ? expf(-decayLambda * (float)pairAgeIndex) : 1.0f;
-        const float decayMul = (blendMode == 2) ? expf(-decayLambda * invSteps) : 1.0f;
-        const float baseGate = motionGate * lumaGate;
+        float timeW = (blendMode == 2) ? expf(-decayLambda * (float)pairAgeIndex * pairTimeStep) : 1.0f;
+        const float decayMul = (blendMode == 2) ? expf(-decayLambda * invSteps * pairTimeStep) : 1.0f;
+        const float baseGate = motionGate * lumaGate * fgMatteW;
+        hdrW *= fgMatteW;
 
-        float px = (float)x, py = (float)y;
         float sr = rA, sg = gA, sb = bA;
 
         int curX0 = -2147483647, curY0 = -2147483647;
@@ -1447,6 +1762,9 @@ __global__ void trailPairSplatMovingKernel(
         float c11r = 0.0f, c11g = 0.0f, c11b = 0.0f, c11w = 0.0f;
 
         for (int s = 0; s < adaptiveSteps; ++s) {
+            float alpha = (float)s * invSteps;
+            float px = (float)x + (c1x + c2x * alpha) * alpha;
+            float py = (float)y + (c1y + c2y * alpha) * alpha;
             int x0 = (int)floorf(px);
             int y0 = (int)floorf(py);
             if (x0 != curX0 || y0 != curY0) {
@@ -1516,8 +1834,6 @@ __global__ void trailPairSplatMovingKernel(
                 }
             }
 
-            px += stepVx;
-            py += stepVy;
             sr += dr;
             sg += dg;
             sb += db;
@@ -1567,7 +1883,7 @@ __global__ void trailCompositeAndFinalizeKernel(
     int w, int h,
     const float* currRGBA, const float* currMatte, int currMatteComp,
     const float* lastRGBA, const float* lastMatte, int lastMatteComp,
-    int hasLastFrame, float lastTimeW,
+    int hasLastFrame, float lastTimeW, float totalWindowW,
     TrailPairBatch batch,
     const float4* uncachedAccum, int hasUncached,
     int hasMatte, int matteMode, int blendMode,
@@ -1587,15 +1903,59 @@ __global__ void trailCompositeAndFinalizeKernel(
     float cg = dwiToLinearChannel(cur.y);
     float cb = dwiToLinearChannel(cur.z);
 
+    const bool fgIso = (hasMatte && matteMode == 1);
+    float currM = (fgIso && currMatte && currMatteComp > 0) ? readMatteVal(currMatte, idx, currMatteComp) : 1.0f;
+
     float4 acc = (blendMode == 1)
                      ? make_float4(cr, cg, cb, 1.0f)
-                     : make_float4(cr * 0.02f, cg * 0.02f, cb * 0.02f, 0.02f);
+                     : (fgIso ? make_float4(0.0f, 0.0f, 0.0f, 0.0f)
+                              : make_float4(cr * 0.02f, cg * 0.02f, cb * 0.02f, 0.02f));
 
+    float lastM = 1.0f;
+    float3 lastLin = make_float3(cr, cg, cb);
+    bool hasLastLin = false;
     if (hasLastFrame && lastRGBA) {
-        float lastM = (hasMatte && matteMode == 2 && lastMatte && lastMatteComp > 0)
-                          ? readMatteVal(lastMatte, idx, lastMatteComp)
-                          : 1.0f;
-        if (hasMatte && matteMode == 2 && lastM <= 0.001f) {
+        lastM = (hasMatte && matteMode != 0 && lastMatte && lastMatteComp > 0)
+                    ? readMatteVal(lastMatte, idx, lastMatteComp)
+                    : 1.0f;
+        if (fgIso) {
+            const float4* last4 = (const float4*)lastRGBA;
+            float4 pL = __ldg(&last4[idx]);
+            lastLin = make_float3(dwiToLinearChannel(pL.x), dwiToLinearChannel(pL.y), dwiToLinearChannel(pL.z));
+            hasLastLin = true;
+            if (lastM >= 0.5f) {
+                if (blendMode == 1) {
+                    if (motionThreshold <= 0.0f) {
+                        float lumaGate = 1.0f;
+                        if (lumaThreshold > 0.0f) {
+                            float luma = dwgLuminance(lastLin.x, lastLin.y, lastLin.z);
+                            float lumaDwi = linearToDwiChannel(luma);
+                            lumaGate = smoothstepf(lumaThreshold, lumaThreshold + 0.12f, lumaDwi);
+                        }
+                        if (lumaGate > 0.01f) {
+                            float vr = lastLin.x * lumaGate * lastM, vg = lastLin.y * lumaGate * lastM, vb = lastLin.z * lumaGate * lastM;
+                            if (vr > 0.0f) acc.x = fmaxf(acc.x, vr);
+                            if (vg > 0.0f) acc.y = fmaxf(acc.y, vg);
+                            if (vb > 0.0f) acc.z = fmaxf(acc.z, vb);
+                        }
+                    }
+                } else {
+                    float hdrW = 1.0f;
+                    if (highlightBoost > 0.0f) {
+                        float luma = dwgLuminance(lastLin.x, lastLin.y, lastLin.z);
+                        if (luma > 0.8f) {
+                            float ex = luma - 0.8f;
+                            hdrW += highlightBoost * ex * sqrtf(ex);
+                        }
+                    }
+                    float wTot = lastTimeW * hdrW * lastM;
+                    acc.x += lastLin.x * wTot;
+                    acc.y += lastLin.y * wTot;
+                    acc.z += lastLin.z * wTot;
+                    acc.w += wTot;
+                }
+            }
+        } else if (hasMatte && matteMode == 2 && lastM <= 0.001f) {
             if (blendMode != 1) {
                 const float4* last4 = (const float4*)lastRGBA;
                 float4 pL = __ldg(&last4[idx]);
@@ -1627,21 +1987,20 @@ __global__ void trailCompositeAndFinalizeKernel(
         } else {
             const float4* last4 = (const float4*)lastRGBA;
             float4 pL = __ldg(&last4[idx]);
-            float lr = dwiToLinearChannel(pL.x);
-            float lg = dwiToLinearChannel(pL.y);
-            float lb = dwiToLinearChannel(pL.z);
+            lastLin = make_float3(dwiToLinearChannel(pL.x), dwiToLinearChannel(pL.y), dwiToLinearChannel(pL.z));
+            hasLastLin = true;
             float hdrW = 1.0f;
             if (highlightBoost > 0.0f) {
-                float luma = dwgLuminance(lr, lg, lb);
+                float luma = dwgLuminance(lastLin.x, lastLin.y, lastLin.z);
                 if (luma > 0.8f) {
                     float ex = luma - 0.8f;
                     hdrW += highlightBoost * ex * sqrtf(ex);
                 }
             }
             float wTot = lastTimeW * hdrW;
-            acc.x += lr * wTot;
-            acc.y += lg * wTot;
-            acc.z += lb * wTot;
+            acc.x += lastLin.x * wTot;
+            acc.y += lastLin.y * wTot;
+            acc.z += lastLin.z * wTot;
             acc.w += wTot;
         }
     }
@@ -1685,6 +2044,20 @@ __global__ void trailCompositeAndFinalizeKernel(
         og_ = acc.y;
         ob_ = acc.z;
     } else {
+        if (fgIso) {
+            float bgW = fmaxf(0.0f, totalWindowW - acc.w);
+            float3 bgCol = (currM >= 0.5f && hasLastLin && lastM < 0.5f) ? lastLin : make_float3(cr, cg, cb);
+            acc.x += bgCol.x * bgW;
+            acc.y += bgCol.y * bgW;
+            acc.z += bgCol.z * bgW;
+            acc.w += bgW;
+        } else if (acc.w < 0.25f && hasLastLin) {
+            float fillW = 0.25f - acc.w;
+            acc.x += lastLin.x * fillW;
+            acc.y += lastLin.y * fillW;
+            acc.z += lastLin.z * fillW;
+            acc.w += fillW;
+        }
         float invW = 1.0f / fmaxf(1e-5f, acc.w);
         or_ = acc.x * invW;
         og_ = acc.y * invW;
@@ -2003,9 +2376,13 @@ bool CudaEngine::compileKernels() {
     ok &= (g_cu.cuModuleGetFunction(&m_fnJointBilateralFilter, m_module, "jointBilateralFlowFilterKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnJointBilateralUpsample, m_module, "jointBilateralUpsampleKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnPackBidirectional, m_module, "packBidirectionalKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnCompareFrames, m_module, "compareFramesKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnTileMaxVel, m_module, "tileMaxVelKernel") == CUDA_SUCCESS_VAL);
-    ok &= (g_cu.cuModuleGetFunction(&m_fnNeighborMaxVel, m_module, "neighborMaxVelKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnNeighborMaxVelH, m_module, "neighborMaxVelHKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnNeighborMaxVelV, m_module, "neighborMaxVelVKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnShutterBlur, m_module, "synthesizeShutterBlurKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnAccumLinearFromDwi, m_module, "accumLinearFromDwiKernel") == CUDA_SUCCESS_VAL);
+    ok &= (g_cu.cuModuleGetFunction(&m_fnEncodeLinearToDwi, m_module, "encodeLinearToDwiKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnTrailPairInitStatic, m_module, "trailPairInitStaticKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnTrailPairSplatMoving, m_module, "trailPairSplatMovingKernel") == CUDA_SUCCESS_VAL);
     ok &= (g_cu.cuModuleGetFunction(&m_fnTrailCompositeAndFinalize, m_module, "trailCompositeAndFinalizeKernel") == CUDA_SUCCESS_VAL);
@@ -2211,7 +2588,7 @@ bool CudaEngine::launchFlowFromPyramids(
 
     uint64_t devPrevFlow = 0;
     size_t prevFlowBytes = 0;
-    float sigmaRange = 0.03f + (1.0f - flowDetail) * 0.12f;
+    float sigmaRange = 0.012f + (1.0f - flowDetail) * 0.055f;
 
     for (int lvl = numLevels - 1; lvl >= finestLevel; --lvl) {
         int w = pyrA.lw[lvl];
@@ -2247,7 +2624,7 @@ bool CudaEngine::launchFlowFromPyramids(
 
         int searchRadius = 0;
         if (lvl == numLevels - 1) {
-            searchRadius = (numLevels <= 4) ? 5 : 3;
+            searchRadius = (numLevels == 5) ? 3 : 5;
         } else if (lvl >= 2) {
             searchRadius = 1;
         }
@@ -2420,6 +2797,7 @@ inline TrailSplatCacheKey makeTrailSplatCacheKey(
     key.motionThresholdQuantized = isLightPainting ? static_cast<int>(std::lround(params.motionThreshold * 1000.0f)) : 0;
     key.lumaThresholdQuantized = isLightPainting ? static_cast<int>(std::lround(params.lumaThreshold * 1000.0f)) : 0;
     key.trailDecayQuantized = isComet ? static_cast<int>(std::lround(params.trailDecay * 1000.0f)) : 0;
+    key.pairTimeStepQuantized = isComet ? static_cast<int>(std::lround(params.pairTimeStep * 1000.0f)) : 1000;
     key.highlightBoostQuantized = !isLightPainting ? static_cast<int>(std::lround(params.highlightBoost * 1000.0f)) : 0;
     return key;
 }
@@ -2581,6 +2959,140 @@ std::shared_ptr<FlowEntry> CudaEngine::getOrComputeFlowPair(
                params, cache, stream).entry;
 }
 
+bool CudaEngine::areFramesDistinct(
+    uint64_t devFrameA, uint64_t devFrameB, int width, int height, void* stream)
+{
+    if (!initialize() || !devFrameA || !devFrameB || width <= 0 || height <= 0) {
+        return true;
+    }
+    if (devFrameA == devFrameB) {
+        return false;
+    }
+    uint64_t devFlag = acquireScratch(sizeof(int), stream);
+    if (!devFlag) return true;
+    void* pCmp[] = {&width, &height, &devFrameA, &devFrameB, &devFlag};
+    g_cu.cuLaunchKernel(m_fnCompareFrames, 1, 1, 1, 256, 1, 1, 0, stream, pCmp, nullptr);
+    int hostFlag = 1;
+    downloadFromDevice(&hostFlag, devFlag, sizeof(int), stream);
+    syncStream(stream);
+    releaseScratch(devFlag, sizeof(int), stream);
+    return hostFlag != 0;
+}
+
+bool CudaEngine::renderSingleShutterPass(
+    const void* instanceId,
+    const FrameInput* prevF,
+    const FrameInput& currF,
+    const FrameInput* nextF,
+    PyramidSet* pyrPrev,
+    PyramidSet* pyrCurr,
+    PyramidSet* pyrNext,
+    uint64_t devCurrMatte,
+    int hasMatte,
+    uint64_t targetBuf,
+    const RenderParams& params,
+    FlowCache& cache,
+    void* stream)
+{
+    const int w = params.width;
+    const int h = params.height;
+    const unsigned int bx = 16, by = 16;
+    unsigned int gx = 0, gy = 0;
+    grid2D(w, h, bx, by, gx, gy);
+
+    PyramidSet localPyrCurr;
+    PyramidSet* usePyrCurr = pyrCurr ? pyrCurr : &localPyrCurr;
+
+    FlowPairResult flowFwdRes;
+    FlowPairResult flowBwdRes;
+    if (nextF && nextF->deviceRGBA) {
+        flowFwdRes = getOrComputeFlowPairCanonical(
+            instanceId,
+            currF.frameIndex, currF.deviceRGBA, currF.deviceMatte, currF.matteComponents,
+            nextF->frameIndex, nextF->deviceRGBA, nextF->deviceMatte, nextF->matteComponents,
+            params, cache, stream, usePyrCurr, pyrNext);
+    }
+    if (prevF && prevF->deviceRGBA) {
+        flowBwdRes = getOrComputeFlowPairCanonical(
+            instanceId,
+            currF.frameIndex, currF.deviceRGBA, currF.deviceMatte, currF.matteComponents,
+            prevF->frameIndex, prevF->deviceRGBA, prevF->deviceMatte, prevF->matteComponents,
+            params, cache, stream, usePyrCurr, pyrPrev);
+    }
+    releasePyramid(localPyrCurr, stream);
+
+    const int tileSize = 16;
+    const int tileW = (w + tileSize - 1) / tileSize;
+    const int tileH = (h + tileSize - 1) / tileSize;
+    const size_t tileBytes = static_cast<size_t>(tileW) * tileH * sizeof(Float4);
+    uint64_t devTileMax = acquireScratch(tileBytes, stream);
+    uint64_t devTmpMax = acquireScratch(tileBytes, stream);
+    uint64_t devNeighborMax = acquireScratch(tileBytes, stream);
+
+    unsigned int tgx = 0, tgy = 0;
+    grid2D(tileW, tileH, bx, by, tgx, tgy);
+
+    uint64_t f4Fwd = flowFwdRes.entry ? flowFwdRes.entry->devFlow4 : 0;
+    uint64_t c2Fwd = flowFwdRes.entry ? flowFwdRes.entry->devConf2 : 0;
+    int fwdRev = flowFwdRes.reversed ? 1 : 0;
+    uint64_t f4Bwd = flowBwdRes.entry ? flowBwdRes.entry->devFlow4 : 0;
+    uint64_t c2Bwd = flowBwdRes.entry ? flowBwdRes.entry->devConf2 : 0;
+    int bwdRev = flowBwdRes.reversed ? 1 : 0;
+
+    float dtInvFwd = (params.fwdFrameStep > 1e-4f) ? (1.0f / params.fwdFrameStep) : 1.0f;
+    float dtInvBwd = (params.bwdFrameStep > 1e-4f) ? (1.0f / params.bwdFrameStep) : 1.0f;
+    float sens = params.motionSensitivity;
+    float mt = params.motionThreshold;
+
+    void* pTile[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                     const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
+                     &f4Fwd, &fwdRev, &c2Fwd, &dtInvFwd,
+                     &f4Bwd, &bwdRev, &c2Bwd, &dtInvBwd,
+                     &sens, &mt, &devTileMax};
+    g_cu.cuLaunchKernel(m_fnTileMaxVel, static_cast<unsigned int>(tileW), static_cast<unsigned int>(tileH), 1,
+                        16, 16, 1, 0, stream, pTile, nullptr);
+
+    float sSpan = (params.shutterAngle / 360.0f) * params.timebaseScale;
+    float sPhase = (params.shutterPhase / 360.0f) * params.timebaseScale;
+    float maxHalfSpan = 0.5f * sSpan + std::fabs(sPhase);
+    int tileRadius = std::clamp(static_cast<int>(std::ceil(0.14f * static_cast<float>(w) * maxHalfSpan / static_cast<float>(tileSize))), 1, 12);
+
+    void* pNeighH[] = {const_cast<int*>(&tileW), const_cast<int*>(&tileH), &tileRadius, &devTileMax, &devTmpMax};
+    g_cu.cuLaunchKernel(m_fnNeighborMaxVelH, tgx, tgy, 1, bx, by, 1, 0, stream, pNeighH, nullptr);
+    void* pNeighV[] = {const_cast<int*>(&tileW), const_cast<int*>(&tileH), &tileRadius, &devTmpMax, &devNeighborMax};
+    g_cu.cuLaunchKernel(m_fnNeighborMaxVelV, tgx, tgy, 1, bx, by, 1, 0, stream, pNeighV, nullptr);
+
+    uint64_t prevRGBA = prevF ? prevF->deviceRGBA : 0;
+    uint64_t nextRGBA = nextF ? nextF->deviceRGBA : 0;
+    uint64_t prevMatte = prevF ? prevF->deviceMatte : 0;
+    int prevMatteComp = prevF ? prevF->matteComponents : 0;
+    uint64_t nextMatte = nextF ? nextF->deviceMatte : 0;
+    int nextMatteComp = nextF ? nextF->matteComponents : 0;
+
+    int mMode = static_cast<int>(params.matteMode);
+    int sSamples = params.shutterSamples;
+    int autoSamples = params.autoShutterSamples ? 1 : 0;
+    float hBoost = params.highlightBoost;
+
+    void* pBlur[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                     const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
+                     const_cast<uint64_t*>(&currF.deviceRGBA), &prevRGBA, &nextRGBA,
+                     &f4Fwd, &fwdRev, &c2Fwd, &dtInvFwd,
+                     &f4Bwd, &bwdRev, &c2Bwd, &dtInvBwd,
+                     &devNeighborMax,
+                     &devCurrMatte, &prevMatte, &prevMatteComp, &nextMatte, &nextMatteComp,
+                     &hasMatte, &mMode,
+                     &sSpan, &sPhase, &sSamples, &autoSamples,
+                     &sens, &mt, &hBoost,
+                     &targetBuf};
+    g_cu.cuLaunchKernel(m_fnShutterBlur, gx, gy, 1, bx, by, 1, 0, stream, pBlur, nullptr);
+
+    releaseScratch(devTileMax, tileBytes, stream);
+    releaseScratch(devTmpMax, tileBytes, stream);
+    releaseScratch(devNeighborMax, tileBytes, stream);
+    return true;
+}
+
 bool CudaEngine::renderFrame(
     const void* instanceId,
     const std::vector<FrameInput>& frames,
@@ -2588,7 +3100,8 @@ bool CudaEngine::renderFrame(
     uint64_t devOutputRGBA,
     const RenderParams& params,
     FlowCache& cache,
-    void* stream)
+    void* stream,
+    const std::vector<FrameInput>* shutterSubFrames)
 {
     if (!initialize() || centerIdx < 0 || centerIdx >= static_cast<int>(frames.size())) {
         return false;
@@ -2603,14 +3116,18 @@ bool CudaEngine::renderFrame(
     unsigned int gx = 0, gy = 0;
     grid2D(w, h, bx, by, gx, gy);
 
-    // Extract single-channel matte only when needed by Diagnostic View or Shutter Blur
+    const bool useSubFrames = (params.viewMode == eViewFinal) &&
+                              (params.mode == eModeShutterBlur || params.mode == eModeCombined) &&
+                              (shutterSubFrames != nullptr) &&
+                              (shutterSubFrames->size() >= 3);
+
+    // Extract single-channel matte only when needed by Diagnostic View or single-pass Shutter Blur
     uint64_t devCurrMatte = 0;
     const size_t floatBufBytes = nPix * sizeof(float);
     int hasMatte = (curr.deviceMatte != 0 && curr.matteComponents > 0 && params.matteMode != eMatteIgnore) ? 1 : 0;
     const bool needsCurrMatteTex = (hasMatte != 0) &&
                                    ((params.viewMode != eViewFinal) ||
-                                    (params.mode == eModeShutterBlur) ||
-                                    (params.mode == eModeCombined));
+                                    (!useSubFrames && (params.mode == eModeShutterBlur || params.mode == eModeCombined)));
     if (needsCurrMatteTex) {
         devCurrMatte = acquireScratch(floatBufBytes, stream);
         uint64_t tmpLuma = acquireScratch(floatBufBytes, stream);
@@ -2622,15 +3139,10 @@ bool CudaEngine::renderFrame(
         releaseScratch(tmpLuma, floatBufBytes, stream);
     }
 
-    // Compute bidirectional flow around center frame t -> t+1 and t -> t-1 only when needed
-    FlowPairResult flowFwdRes;
-    FlowPairResult flowBwdRes;
-    const bool needsCenterFlow = (params.viewMode != eViewFinal) ||
-                                 (params.mode == eModeShutterBlur) ||
-                                 (params.mode == eModeCombined);
-
-    if (needsCenterFlow) {
+    // Diagnostic views
+    if (params.viewMode != eViewFinal) {
         PyramidSet pyrCurr;
+        FlowPairResult flowFwdRes, flowBwdRes;
         if (centerIdx + 1 < static_cast<int>(frames.size())) {
             const auto& nextF = frames[centerIdx + 1];
             flowFwdRes = getOrComputeFlowPairCanonical(
@@ -2648,10 +3160,7 @@ bool CudaEngine::renderFrame(
                 params, cache, stream, &pyrCurr, nullptr);
         }
         releasePyramid(pyrCurr, stream);
-    }
 
-    // Diagnostic views
-    if (params.viewMode != eViewFinal) {
         int vm = static_cast<int>(params.viewMode);
         const FlowPairResult& diagFlow = flowFwdRes.entry ? flowFwdRes : flowBwdRes;
         uint64_t f4 = diagFlow.entry ? diagFlow.entry->devFlow4 : 0;
@@ -2675,59 +3184,94 @@ bool CudaEngine::renderFrame(
 
     // Pass 1: Natural Shutter Blur (if eModeShutterBlur or eModeCombined)
     if (params.mode == eModeShutterBlur || params.mode == eModeCombined) {
-        const int tileSize = 16;
-        const int tileW = (w + tileSize - 1) / tileSize;
-        const int tileH = (h + tileSize - 1) / tileSize;
-        const size_t tileBytes = static_cast<size_t>(tileW) * tileH * sizeof(Float2);
-        uint64_t devTileMax = acquireScratch(tileBytes, stream);
-        uint64_t devNeighborMax = acquireScratch(tileBytes, stream);
-
-        unsigned int tgx = 0, tgy = 0;
-        grid2D(tileW, tileH, bx, by, tgx, tgy);
-
-        uint64_t f4Fwd = flowFwdRes.entry ? flowFwdRes.entry->devFlow4 : 0;
-        int fwdRev = flowFwdRes.reversed ? 1 : 0;
-        uint64_t f4Bwd = flowBwdRes.entry ? flowBwdRes.entry->devFlow4 : 0;
-        int bwdRev = flowBwdRes.reversed ? 1 : 0;
-        uint64_t c2Ptr = flowFwdRes.entry ? flowFwdRes.entry->devConf2 : (flowBwdRes.entry ? flowBwdRes.entry->devConf2 : 0);
-        float sens = params.motionSensitivity;
-        float mt = params.motionThreshold;
-
-        // 1 block of 16x16 threads per tile for coalesced parallel max reduction
-        void* pTile[] = {const_cast<int*>(&w), const_cast<int*>(&h),
-                         const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
-                         &f4Fwd, &fwdRev, &f4Bwd, &bwdRev, &sens, &mt, &devTileMax};
-        g_cu.cuLaunchKernel(m_fnTileMaxVel, static_cast<unsigned int>(tileW), static_cast<unsigned int>(tileH), 1,
-                            16, 16, 1, 0, stream, pTile, nullptr);
-
-        void* pNeigh[] = {const_cast<int*>(&tileW), const_cast<int*>(&tileH), &devTileMax, &devNeighborMax};
-        g_cu.cuLaunchKernel(m_fnNeighborMaxVel, tgx, tgy, 1, bx, by, 1, 0, stream, pNeigh, nullptr);
-
         uint64_t targetBuf = devOutputRGBA;
         if (params.mode == eModeCombined) {
             intermediateShutterOut = acquireScratch(rgbaBytes, stream);
             targetBuf = intermediateShutterOut;
         }
 
-        int mMode = static_cast<int>(params.matteMode);
-        float sAngle = params.shutterAngle;
-        float sPhase = params.shutterPhase;
-        int sSamples = params.shutterSamples;
-        int autoSamples = params.autoShutterSamples ? 1 : 0;
-        float hBoost = params.highlightBoost;
+        if (useSubFrames) {
+            const auto& sub = *shutterSubFrames;
+            const int M = static_cast<int>(sub.size());
+            const float effSpan = (params.shutterAngle / 360.0f) * params.timebaseScale;
+            const float effPhase = (params.shutterPhase / 360.0f) * params.timebaseScale;
+            const float tauMin = effPhase - 0.5f * effSpan;
+            const float tauMax = effPhase + 0.5f * effSpan;
 
-        void* pBlur[] = {const_cast<int*>(&w), const_cast<int*>(&h),
-                         const_cast<int*>(&tileW), const_cast<int*>(&tileH), const_cast<int*>(&tileSize),
-                         const_cast<uint64_t*>(&curr.deviceRGBA),
-                         &f4Fwd, &fwdRev, &f4Bwd, &bwdRev, &c2Ptr, &devNeighborMax,
-                         &devCurrMatte, &hasMatte, &mMode,
-                         &sAngle, &sPhase, &sSamples, &autoSamples,
-                         &sens, &mt, &hBoost,
-                         &targetBuf};
-        g_cu.cuLaunchKernel(m_fnShutterBlur, gx, gy, 1, bx, by, 1, 0, stream, pBlur, nullptr);
+            uint64_t devAccumLin = acquireScratch(rgbaBytes, stream);
+            uint64_t devSegOut = acquireScratch(rgbaBytes, stream);
+            uint64_t devSubMatte = hasMatte ? acquireScratch(floatBufBytes, stream) : 0;
+            uint64_t tmpLuma = hasMatte ? acquireScratch(floatBufBytes, stream) : 0;
 
-        releaseScratch(devTileMax, tileBytes, stream);
-        releaseScratch(devNeighborMax, tileBytes, stream);
+            std::vector<PyramidSet> subPyrs(M);
+            float totalSegDur = 0.0f;
+            int accumIdx = 0;
+
+            for (int j = 0; j < M; ++j) {
+                float vLo = (j > 0) ? 0.5f * (sub[j - 1].relTime + sub[j].relTime) : tauMin;
+                float vHi = (j + 1 < M) ? 0.5f * (sub[j].relTime + sub[j + 1].relTime) : tauMax;
+                float segLo = std::max(tauMin, vLo);
+                float segHi = std::min(tauMax, vHi);
+                float segDur = segHi - segLo;
+                if (segDur <= 1e-4f) {
+                    if (j > 0) releasePyramid(subPyrs[j - 1], stream);
+                    continue;
+                }
+
+                int subHasMatte = (sub[j].deviceMatte != 0 && sub[j].matteComponents > 0 && params.matteMode != eMatteIgnore) ? 1 : 0;
+                if (subHasMatte && devSubMatte) {
+                    int comp = sub[j].matteComponents;
+                    void* pEx[] = {const_cast<int*>(&w), const_cast<int*>(&h),
+                                   const_cast<uint64_t*>(&sub[j].deviceRGBA), const_cast<uint64_t*>(&sub[j].deviceMatte),
+                                   &comp, &tmpLuma, &devSubMatte};
+                    g_cu.cuLaunchKernel(m_fnExtractLumaMatte, gx, gy, 1, bx, by, 1, 0, stream, pEx, nullptr);
+                }
+
+                RenderParams segP = params;
+                segP.timebaseScale = 1.0f;
+                segP.shutterAngle = segDur * 360.0f;
+                segP.shutterPhase = (0.5f * (segLo + segHi) - sub[j].relTime) * 360.0f;
+                segP.bwdFrameStep = (j > 0) ? std::max(1e-3f, sub[j].relTime - sub[j - 1].relTime) : 1.0f;
+                segP.fwdFrameStep = (j + 1 < M) ? std::max(1e-3f, sub[j + 1].relTime - sub[j].relTime) : 1.0f;
+
+                const FrameInput* pPrev = (j > 0) ? &sub[j - 1] : nullptr;
+                const FrameInput* pNext = (j + 1 < M) ? &sub[j + 1] : nullptr;
+                PyramidSet* pyrPrev = (j > 0) ? &subPyrs[j - 1] : nullptr;
+                PyramidSet* pyrNext = (j + 1 < M) ? &subPyrs[j + 1] : nullptr;
+
+                renderSingleShutterPass(
+                    instanceId, pPrev, sub[j], pNext, pyrPrev, &subPyrs[j], pyrNext,
+                    subHasMatte ? devSubMatte : 0, subHasMatte, devSegOut, segP, cache, stream);
+
+                int isFirst = (accumIdx == 0) ? 1 : 0;
+                void* pAcc[] = {const_cast<int*>(&w), const_cast<int*>(&h), &devSegOut, &segDur, &isFirst, &devAccumLin};
+                g_cu.cuLaunchKernel(m_fnAccumLinearFromDwi, gx, gy, 1, bx, by, 1, 0, stream, pAcc, nullptr);
+
+                totalSegDur += segDur;
+                ++accumIdx;
+                if (j > 0) releasePyramid(subPyrs[j - 1], stream);
+            }
+            for (int j = 0; j < M; ++j) releasePyramid(subPyrs[j], stream);
+
+            if (totalSegDur > 1e-6f) {
+                float invTotalW = 1.0f / totalSegDur;
+                void* pEnc[] = {const_cast<int*>(&w), const_cast<int*>(&h), &devAccumLin, &invTotalW, &targetBuf};
+                g_cu.cuLaunchKernel(m_fnEncodeLinearToDwi, gx, gy, 1, bx, by, 1, 0, stream, pEnc, nullptr);
+            } else {
+                copyDeviceToDevice(targetBuf, curr.deviceRGBA, rgbaBytes, stream);
+            }
+
+            if (devSubMatte) releaseScratch(devSubMatte, floatBufBytes, stream);
+            if (tmpLuma) releaseScratch(tmpLuma, floatBufBytes, stream);
+            releaseScratch(devSegOut, rgbaBytes, stream);
+            releaseScratch(devAccumLin, rgbaBytes, stream);
+        } else {
+            const FrameInput* prevF = (centerIdx - 1 >= 0) ? &frames[centerIdx - 1] : nullptr;
+            const FrameInput* nextF = (centerIdx + 1 < static_cast<int>(frames.size())) ? &frames[centerIdx + 1] : nullptr;
+            renderSingleShutterPass(
+                instanceId, prevF, curr, nextF, nullptr, nullptr, nullptr,
+                devCurrMatte, hasMatte, targetBuf, params, cache, stream);
+        }
 
         if (params.mode == eModeShutterBlur) {
             if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
@@ -2747,6 +3291,21 @@ bool CudaEngine::renderFrame(
     float lt = params.lumaThreshold;
     float hBoost = params.highlightBoost;
     const float decayLambda = 0.25f + 3.2f * decay;
+    float pairStep = (params.pairTimeStep > 1e-4f) ? params.pairTimeStep : 1.0f;
+
+    if (params.sequentialCache && params.isDuplicateFrame) {
+        auto seqDup = cache.getOrCreateSequentialState(instanceId);
+        if (seqDup->isGpu && seqDup->width == w && seqDup->height == h &&
+            seqDup->lastFrame == curr.frameIndex - 1 && seqDup->devAccumRGBA) {
+            float invTotalW = 1.0f;
+            void* pEnc[] = {const_cast<int*>(&w), const_cast<int*>(&h), &seqDup->devAccumRGBA, &invTotalW, &devOutputRGBA};
+            g_cu.cuLaunchKernel(m_fnEncodeLinearToDwi, gx, gy, 1, bx, by, 1, 0, stream, pEnc, nullptr);
+            seqDup->lastFrame = curr.frameIndex;
+            if (intermediateShutterOut) releaseScratch(intermediateShutterOut, rgbaBytes, stream);
+            if (devCurrMatte) releaseScratch(devCurrMatte, floatBufBytes, stream);
+            return true;
+        }
+    }
 
     const int numPairs = maxLookback; // k = 0 .. numPairs - 1, plus oldest endpoint at centerIdx - maxLookback
     const size_t workingSetBytes = static_cast<size_t>(numPairs) * rgbaBytes;
@@ -2858,9 +3417,32 @@ bool CudaEngine::renderFrame(
         uint64_t c2 = pairFlows[k].entry ? pairFlows[k].entry->devConf2 : 0;
         int flowRev = pairFlows[k].reversed ? 1 : 0;
 
-        uint64_t matteA = (hasMatte && mMode == 2 && fA.deviceMatte != 0 && fA.matteComponents > 0) ? fA.deviceMatte : 0;
+        uint64_t matteA = (hasMatte && mMode != 0 && fA.deviceMatte != 0 && fA.matteComponents > 0) ? fA.deviceMatte : 0;
         int matteAComp = matteA ? fA.matteComponents : 0;
         int pairHasMatte = matteA ? 1 : 0;
+
+        uint64_t nextF4 = 0;
+        uint64_t nextC2 = 0;
+        int nextRev = 0;
+        if (subSteps > 1 && needsPairFlow && (k + 1 < numPairs)) {
+            FlowPairResult nextFlow = pairFlows[k + 1];
+            if (!nextFlow.entry) {
+                const FrameInput& nfA = frames[centerIdx - (k + 1)];
+                const FrameInput& nfB = frames[centerIdx - (k + 1) - 1];
+                const bool nRev = (nfA.frameIndex > nfB.frameIndex);
+                const int nfLow = nRev ? nfB.frameIndex : nfA.frameIndex;
+                const int nfHigh = nRev ? nfA.frameIndex : nfB.frameIndex;
+                if (auto cachedNext = cache.get(makeFlowCacheKey(instanceId, nfLow, nfHigh, params))) {
+                    nextFlow = {cachedNext, nRev};
+                    pairFlows[k + 1] = nextFlow;
+                }
+            }
+            if (nextFlow.entry) {
+                nextF4 = nextFlow.entry->devFlow4;
+                nextC2 = nextFlow.entry->devConf2;
+                nextRev = nextFlow.reversed ? 1 : 0;
+            }
+        }
 
         const bool isCombinedPair0 = (params.mode == eModeCombined && k == 0);
         const bool storeAsPairEntry = canCacheSplats && !isCombinedPair0 && (k < 24);
@@ -2905,7 +3487,7 @@ bool CudaEngine::renderFrame(
                 const_cast<int*>(&w), const_cast<int*>(&h),
                 &rgbaA, &f4, &flowRev,
                 &matteA, &matteAComp, &pairHasMatte, &mMode,
-                &pairAge, &subSteps,
+                &pairAge, &pairStep, &subSteps,
                 &bMode, &decay,
                 &sens, &mt, &lt,
                 &hBoost, &addToExisting,
@@ -2917,8 +3499,9 @@ bool CudaEngine::renderFrame(
                 void* pSplat[] = {
                     const_cast<int*>(&w), const_cast<int*>(&h),
                     &rgbaA, &rgbaB, &f4, &c2, &flowRev,
+                    &nextF4, &nextC2, &nextRev,
                     &matteA, &matteAComp, &pairHasMatte, &mMode,
-                    &pairAge, &subSteps,
+                    &pairAge, &pairStep, &subSteps,
                     &bMode, &decay,
                     &sens, &mt, &lt,
                     &hBoost, &devTileActive, &targetAccum
@@ -2940,26 +3523,32 @@ bool CudaEngine::renderFrame(
     TrailPairBatch batch{};
     batch.count = 0;
     batch.pad = 0;
-    for (int k = 0; k < numPairs && batch.count < 24; ++k) {
-        if (params.mode == eModeCombined && k == 0 && devPair0) {
-            batch.ptrs[batch.count] = devPair0;
-            batch.scales[batch.count] = 1.0f;
-            ++batch.count;
-        } else if (pairRefs[k] && pairRefs[k]->devAccum4) {
-            batch.ptrs[batch.count] = pairRefs[k]->devAccum4;
-            batch.scales[batch.count] = (bMode == 2) ? std::exp(-decayLambda * static_cast<float>(k)) : 1.0f;
-            ++batch.count;
+    float totalWindowW = 0.0f;
+    for (int k = 0; k < numPairs; ++k) {
+        float sc = (bMode == 2) ? std::exp(-decayLambda * static_cast<float>(k) * pairStep) : 1.0f;
+        totalWindowW += sc;
+        if (batch.count < 24) {
+            if (params.mode == eModeCombined && k == 0 && devPair0) {
+                batch.ptrs[batch.count] = devPair0;
+                batch.scales[batch.count] = 1.0f;
+                ++batch.count;
+            } else if (pairRefs[k] && pairRefs[k]->devAccum4) {
+                batch.ptrs[batch.count] = pairRefs[k]->devAccum4;
+                batch.scales[batch.count] = sc;
+                ++batch.count;
+            }
         }
     }
 
     const FrameInput& fLast = frames[centerIdx - maxLookback];
     uint64_t lastRGBA = (maxLookback == 0) ? shutterSrcRGBA : fLast.deviceRGBA;
-    uint64_t lastMatte = (hasMatte && mMode == 2 && fLast.deviceMatte != 0 && fLast.matteComponents > 0) ? fLast.deviceMatte : 0;
+    uint64_t lastMatte = (hasMatte && mMode != 0 && fLast.deviceMatte != 0 && fLast.matteComponents > 0) ? fLast.deviceMatte : 0;
     int lastMatteComp = lastMatte ? fLast.matteComponents : 0;
     int hasLastFrame = 1;
-    float lastTimeW = (bMode == 2 && maxLookback > 0) ? std::exp(-decayLambda * static_cast<float>(maxLookback)) : 1.0f;
+    float lastTimeW = (bMode == 2 && maxLookback > 0) ? std::exp(-decayLambda * static_cast<float>(maxLookback) * pairStep) : 1.0f;
+    totalWindowW += lastTimeW;
 
-    uint64_t currMattePtr = (hasMatte && mMode == 2 && curr.deviceMatte != 0 && curr.matteComponents > 0) ? curr.deviceMatte : 0;
+    uint64_t currMattePtr = (hasMatte && mMode != 0 && curr.deviceMatte != 0 && curr.matteComponents > 0) ? curr.deviceMatte : 0;
     int currMatteComp = currMattePtr ? curr.matteComponents : 0;
     int hasUncached = devUncachedAccum ? 1 : 0;
     float crisp = params.rearCurtainCrispness;
@@ -2990,7 +3579,7 @@ bool CudaEngine::renderFrame(
         const_cast<int*>(&w), const_cast<int*>(&h),
         &shutterSrcRGBA, &currMattePtr, &currMatteComp,
         &lastRGBA, &lastMatte, &lastMatteComp,
-        &hasLastFrame, &lastTimeW,
+        &hasLastFrame, &lastTimeW, &totalWindowW,
         &batch,
         &devUncachedAccum, &hasUncached,
         &hasMatte, &mMode, &bMode,

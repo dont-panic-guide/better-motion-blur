@@ -73,6 +73,7 @@ struct TrailSplatCacheKey {
     int motionThresholdQuantized = 0;
     int lumaThresholdQuantized = 0;
     int trailDecayQuantized = 0;
+    int pairTimeStepQuantized = 1000;
     int highlightBoostQuantized = 0;
 
     bool operator==(const TrailSplatCacheKey& other) const noexcept {
@@ -91,6 +92,7 @@ struct TrailSplatCacheKey {
                motionThresholdQuantized == other.motionThresholdQuantized &&
                lumaThresholdQuantized == other.lumaThresholdQuantized &&
                trailDecayQuantized == other.trailDecayQuantized &&
+               pairTimeStepQuantized == other.pairTimeStepQuantized &&
                highlightBoostQuantized == other.highlightBoostQuantized;
     }
 };
@@ -115,6 +117,7 @@ struct TrailSplatCacheKeyHash {
         combine(std::hash<int>{}(k.motionThresholdQuantized));
         combine(std::hash<int>{}(k.lumaThresholdQuantized));
         combine(std::hash<int>{}(k.trailDecayQuantized));
+        combine(std::hash<int>{}(k.pairTimeStepQuantized));
         combine(std::hash<int>{}(k.highlightBoostQuantized));
         return h;
     }

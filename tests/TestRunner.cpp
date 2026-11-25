@@ -1017,6 +1017,528 @@ int main() {
                t10Buf);
     }
 
+    // Test 11: Physical 180 deg Shutter Ground-Truth, Large-Displacement (>120px), Curvature/Occlusion & Sub-Frame/Timebase
+    {
+        auto dwiToLin = [](float v) -> float {
+            return (v <= 0.02740668f) ? (v / 10.44426855f) : (std::exp2(v / 0.07329248f - 7.0f) - 0.0075f);
+        };
+        auto linToDwi = [](float l) -> float {
+            return (l <= 0.00262409f) ? (l * 10.44426855f) : ((std::log2(l + 0.0075f) + 7.0f) * 0.07329248f);
+        };
+
+        // 11A: Analytical 64-subframe 180 deg ground-truth profile (no-matte & matte, wide bar + thin fast bar)
+        bool profileOk = false;
+        double rmseGpuNoMatte = 999.0, rmseCpuNoMatte = 999.0, rmseGpuMatte = 999.0;
+        float interiorEdgeR = 1.0f, exteriorRampR = 0.0f, thinBarCenterR = 1.0f;
+        {
+            const int pw = 512, ph = 256;
+            const float speed = 24.0f; // 180 deg => +/-6 px blur
+            const float wideCx = 180.0f, wideHalfW = 20.0f;
+            const float thinCx = 340.0f, thinHalfW = 4.0f; // width 8 < 12 => semi-transparent across center
+
+            auto renderSyntheticBarScene = [&](float tOffset, std::vector<float>& outMatte) {
+                std::vector<float> img(static_cast<size_t>(pw) * ph * 4, 0.0f);
+                outMatte.assign(static_cast<size_t>(pw) * ph, 0.0f);
+                for (int y = 0; y < ph; ++y) {
+                    for (int x = 0; x < pw; ++x) {
+                        size_t idx = (static_cast<size_t>(y) * pw + x) * 4;
+                        float bgR = 0.08f + 0.02f * std::sin(x * 0.19f) * std::cos(y * 0.17f);
+                        float bgG = 0.18f + 0.03f * std::cos(x * 0.13f + y * 0.11f);
+                        float bgB = 0.42f + 0.04f * std::sin(x * 0.11f - y * 0.15f);
+                        float r = bgR, g = bgG, b = bgB, m = 0.0f;
+
+                        float dxW = static_cast<float>(x) - (wideCx + tOffset * speed);
+                        float dxT = static_cast<float>(x) - (thinCx + tOffset * speed);
+                        if ((y >= 64 && y < 128 && std::fabs(dxW) <= wideHalfW) ||
+                            (y >= 144 && y < 200 && std::fabs(dxT) <= thinHalfW)) {
+                            r = 0.48f; g = 0.22f; b = 0.12f; m = 1.0f;
+                        }
+                        img[idx + 0] = r; img[idx + 1] = g; img[idx + 2] = b; img[idx + 3] = 1.0f;
+                        outMatte[static_cast<size_t>(y) * pw + x] = m;
+                    }
+                }
+                return img;
+            };
+
+            std::vector<float> mPrev, mCurr, mNext;
+            auto fPrev = renderSyntheticBarScene(-1.0f, mPrev);
+            auto fCurr = renderSyntheticBarScene(0.0f, mCurr);
+            auto fNext = renderSyntheticBarScene(1.0f, mNext);
+
+            // Analytical 64-subframe linear-light camera integral over tau in [-0.25, +0.25]
+            std::vector<float> gtOut(static_cast<size_t>(pw) * ph * 4, 0.0f);
+            std::vector<float> dummyM;
+            const int gtN = 64;
+            for (int s = 0; s < gtN; ++s) {
+                float tau = -0.25f + (static_cast<float>(s) + 0.5f) / gtN * 0.5f;
+                auto sub = renderSyntheticBarScene(tau, dummyM);
+                for (size_t i = 0; i < static_cast<size_t>(pw) * ph; ++i) {
+                    gtOut[i * 4 + 0] += dwiToLin(sub[i * 4 + 0]) / gtN;
+                    gtOut[i * 4 + 1] += dwiToLin(sub[i * 4 + 1]) / gtN;
+                    gtOut[i * 4 + 2] += dwiToLin(sub[i * 4 + 2]) / gtN;
+                }
+            }
+            for (size_t i = 0; i < static_cast<size_t>(pw) * ph; ++i) {
+                gtOut[i * 4 + 0] = linToDwi(gtOut[i * 4 + 0]);
+                gtOut[i * 4 + 1] = linToDwi(gtOut[i * 4 + 1]);
+                gtOut[i * 4 + 2] = linToDwi(gtOut[i * 4 + 2]);
+            }
+
+            std::vector<FrameInput> winNoMatte = {
+                {0, fPrev.data(), 0, nullptr, 0, 0},
+                {1, fCurr.data(), 0, nullptr, 0, 0},
+                {2, fNext.data(), 0, nullptr, 0, 0}
+            };
+            std::vector<FrameInput> winMatte = {
+                {0, fPrev.data(), 0, mPrev.data(), 0, 1},
+                {1, fCurr.data(), 0, mCurr.data(), 0, 1},
+                {2, fNext.data(), 0, mNext.data(), 0, 1}
+            };
+
+            RenderParams p;
+            p.width = pw; p.height = ph;
+            p.mode = eModeShutterBlur;
+            p.flowEngine = eFlowCudaPyramidal;
+            p.matteMode = eMatteForegroundIsolation;
+            p.shutterAngle = 180.0f;
+            p.shutterSamples = 48;
+            p.autoShutterSamples = false;
+            p.highlightBoost = 0.0f;
+
+            std::vector<float> gpuNoMatte(gtOut.size()), cpuNoMatte(gtOut.size()), gpuMatte(gtOut.size());
+            FlowCache c1, c2, c3;
+            bool okG1 = CudaEngine::instance().renderHostFrames(&p, winNoMatte, 1, gpuNoMatte.data(), p, c1);
+            bool okC1 = CpuFallbackProcessor::renderFrame(&p, winNoMatte, 1, cpuNoMatte.data(), p, c2);
+            bool okG2 = CudaEngine::instance().renderHostFrames(&p, winMatte, 1, gpuMatte.data(), p, c3);
+
+            auto evalProfileRmse = [&](const std::vector<float>& out) -> double {
+                double sq = 0.0;
+                size_t cnt = 0;
+                for (int x = static_cast<int>(wideCx - wideHalfW - 10); x <= static_cast<int>(wideCx + wideHalfW + 10); ++x) {
+                    size_t idx = (96 * pw + x) * 4;
+                    double d = out[idx + 0] - gtOut[idx + 0];
+                    sq += d * d;
+                    ++cnt;
+                }
+                for (int x = static_cast<int>(thinCx - 12); x <= static_cast<int>(thinCx + 12); ++x) {
+                    size_t idx = (172 * pw + x) * 4;
+                    double d = out[idx + 0] - gtOut[idx + 0];
+                    sq += d * d;
+                    ++cnt;
+                }
+                return std::sqrt(sq / std::max<size_t>(1, cnt));
+            };
+
+            rmseGpuNoMatte = evalProfileRmse(gpuNoMatte);
+            rmseCpuNoMatte = evalProfileRmse(cpuNoMatte);
+            rmseGpuMatte = evalProfileRmse(gpuMatte);
+
+            interiorEdgeR = gpuNoMatte[(96 * pw + static_cast<int>(wideCx + wideHalfW - 2)) * 4 + 0];
+            exteriorRampR = gpuNoMatte[(96 * pw + static_cast<int>(wideCx + wideHalfW + 3)) * 4 + 0];
+            thinBarCenterR = gpuNoMatte[(172 * pw + static_cast<int>(thinCx)) * 4 + 0];
+
+            profileOk = okG1 && okC1 && okG2 &&
+                        rmseGpuNoMatte < 0.035 && rmseCpuNoMatte < 0.055 && rmseGpuMatte < 0.035 &&
+                        interiorEdgeR < 0.46f && exteriorRampR > 0.16f && exteriorRampR < 0.36f &&
+                        thinBarCenterR < 0.46f;
+        }
+
+        // 11B: Large-displacement optical flow (>120 px/frame at 1920x1080)
+        bool largeDispOk = false;
+        double epe140Neural = 999.0, epe140Pyr = 999.0;
+        {
+            const int lw = 1920, lh = 1080;
+            const float gtDx = 140.0f, gtDy = -32.0f;
+            auto makeNonPeriodicFrame = [&](float shiftX, float shiftY) {
+                std::vector<float> img(static_cast<size_t>(lw) * lh * 4, 1.0f);
+                for (int y = 0; y < lh; ++y) {
+                    for (int x = 0; x < lw; ++x) {
+                        float sx = static_cast<float>(x) - shiftX;
+                        float sy = static_cast<float>(y) - shiftY;
+                        float r, g, b;
+                        evalTextureColor(sx, sy, r, g, b);
+                        // Add non-periodic multi-scale envelope & radial landmarks to prevent sine wrap-around
+                        float env = 0.55f + 0.25f * std::sin(sx * 0.0029f + 0.4f) * std::cos(sy * 0.0037f)
+                                          + 0.20f * std::cos((sx + sy) * 0.0041f);
+                        float gx = std::fmod(std::fabs(sx) * 0.0071f, 1.0f);
+                        float gy = std::fmod(std::fabs(sy) * 0.0053f, 1.0f);
+                        float blob = std::exp(-((gx - 0.5f) * (gx - 0.5f) + (gy - 0.5f) * (gy - 0.5f)) * 18.0f);
+                        size_t idx = (static_cast<size_t>(y) * lw + x) * 4;
+                        img[idx + 0] = std::min(1.0f, std::max(0.0f, r * env + 0.25f * blob));
+                        img[idx + 1] = std::min(1.0f, std::max(0.0f, g * env + 0.15f * std::sin(sx * 0.0063f)));
+                        img[idx + 2] = std::min(1.0f, std::max(0.0f, b * env + 0.20f * std::cos(sy * 0.0079f)));
+                    }
+                }
+                return img;
+            };
+            auto imgA = makeNonPeriodicFrame(0.0f, 0.0f);
+            auto imgB = makeNonPeriodicFrame(gtDx, gtDy);
+            const size_t rgbaBytes = static_cast<size_t>(lw) * lh * 4 * sizeof(float);
+            uint64_t devA = CudaEngine::instance().allocDevice(rgbaBytes);
+            uint64_t devB = CudaEngine::instance().allocDevice(rgbaBytes);
+            CudaEngine::instance().uploadToDevice(devA, imgA.data(), rgbaBytes);
+            CudaEngine::instance().uploadToDevice(devB, imgB.data(), rgbaBytes);
+
+            auto measure1080 = [&](FlowEngineType eng) -> double {
+                FlowCache fc;
+                RenderParams fp;
+                fp.width = lw; fp.height = lh;
+                fp.flowEngine = eng;
+                fp.flowDetail = 0.75f;
+                auto entry = CudaEngine::instance().getOrComputeFlowPair(
+                    &fp, 0, devA, 0, 0, 1, devB, 0, 0, fp, fc, nullptr);
+                CudaEngine::instance().syncStream(nullptr);
+                if (!entry) return 999.0;
+                std::vector<Float4> hostFlow;
+                if (!CudaEngine::instance().downloadFlowToHost(*entry, hostFlow, nullptr)) return 999.0;
+                double sumErr = 0.0;
+                size_t cnt = 0;
+                for (int y = 96; y < lh - 96; y += 4) {
+                    for (int x = 96; x < lw - 200; x += 4) {
+                        const Float4& f = hostFlow[static_cast<size_t>(y) * lw + x];
+                        sumErr += std::hypot(f.x - gtDx, f.y - gtDy);
+                        ++cnt;
+                    }
+                }
+                return sumErr / std::max<size_t>(1, cnt);
+            };
+            epe140Neural = measure1080(eFlowNeural);
+            epe140Pyr = measure1080(eFlowCudaPyramidal);
+            CudaEngine::instance().freeDevice(devA);
+            CudaEngine::instance().freeDevice(devB);
+            largeDispOk = (epe140Neural < 2.0 && epe140Pyr < 2.0);
+        }
+
+        // 11C: Curved trajectory sign (+y vs inverted -y) & single-sided occlusion velocity preservation
+        bool curveAndOccOk = false;
+        float curvePlusY = 0.0f, curveMinusY = 0.0f, occBlurR = 0.0f, unoccBlurR = 0.0f;
+        {
+            const int cw = 256, ch = 192;
+            const float cx = 128.0f, cy = 96.0f;
+            auto makeDiscAt = [&](float px, float py) {
+                std::vector<float> img(static_cast<size_t>(cw) * ch * 4, 0.0f);
+                for (int y = 0; y < ch; ++y) {
+                    for (int x = 0; x < cw; ++x) {
+                        size_t idx = (static_cast<size_t>(y) * cw + x) * 4;
+                        float dx = static_cast<float>(x) - px;
+                        float dy = static_cast<float>(y) - py;
+                        float d = std::hypot(dx, dy);
+                        if (d <= 20.0f) {
+                            float tex = 0.72f + 0.10f * std::sin(dx * 0.35f) * std::cos(dy * 0.35f);
+                            img[idx + 0] = tex; img[idx + 1] = 0.25f; img[idx + 2] = 0.08f;
+                        } else {
+                            float bg = 0.12f + 0.04f * std::sin(x * 0.23f) * std::cos(y * 0.21f);
+                            img[idx + 0] = 0.04f; img[idx + 1] = bg; img[idx + 2] = bg + 0.18f;
+                        }
+                        img[idx + 3] = 1.0f;
+                    }
+                }
+                return img;
+            };
+            // Parabolic motion: p(t) = (cx + 18*t, cy + 16*t^2) -> bends toward +y at t = +/-0.5
+            auto cPrev = makeDiscAt(cx - 18.0f, cy + 16.0f);
+            auto cCurr = makeDiscAt(cx, cy);
+            auto cNext = makeDiscAt(cx + 18.0f, cy + 16.0f);
+            auto cStaticBg = makeDiscAt(-100.0f, -100.0f); // occluded prev
+
+            RenderParams cp;
+            cp.width = cw; cp.height = ch;
+            cp.mode = eModeShutterBlur;
+            cp.flowEngine = eFlowCudaPyramidal;
+            cp.shutterAngle = 360.0f; // tau in [-0.5, +0.5]
+            cp.shutterSamples = 48;
+            cp.autoShutterSamples = false;
+
+            std::vector<FrameInput> curveWin = {
+                {0, cPrev.data(), 0, nullptr, 0, 0},
+                {1, cCurr.data(), 0, nullptr, 0, 0},
+                {2, cNext.data(), 0, nullptr, 0, 0}
+            };
+            std::vector<FrameInput> occWin = {
+                {0, cStaticBg.data(), 0, nullptr, 0, 0},
+                {1, cCurr.data(), 0, nullptr, 0, 0},
+                {2, cNext.data(), 0, nullptr, 0, 0}
+            };
+            std::vector<float> curveOut(cCurr.size()), occOut(cCurr.size());
+            FlowCache fc1, fc2;
+            bool ok1 = CudaEngine::instance().renderHostFrames(&cp, curveWin, 1, curveOut.data(), cp, fc1);
+            bool ok2 = CudaEngine::instance().renderHostFrames(&cp, occWin, 1, occOut.data(), cp, fc2);
+
+            // Check at (cx - 9, cy + 21) vs (cx - 9, cy - 21): true parabola passes through +y side (cy + 4 + 20 = cy + 24)
+            curvePlusY = curveOut[(static_cast<int>(cy + 21) * cw + static_cast<int>(cx - 9)) * 4 + 0];
+            curveMinusY = curveOut[(static_cast<int>(cy - 21) * cw + static_cast<int>(cx - 9)) * 4 + 0];
+
+            // With linear velocity v0 = (18, 0), check blur extension at (cx + 25, cy)
+            unoccBlurR = curveOut[(static_cast<int>(cy) * cw + static_cast<int>(cx + 25)) * 4 + 0];
+            occBlurR = occOut[(static_cast<int>(cy) * cw + static_cast<int>(cx + 25)) * 4 + 0];
+            curveAndOccOk = ok1 && ok2 && (curvePlusY > curveMinusY + 0.08f) && (occBlurR > 0.15f);
+        }
+
+        // 11D: Multi-subframe integration (5 real sub-frames) & eTimebaseClipFps scaling
+        bool subFrameAndTimebaseOk = false;
+        double subGpuCpuDiff = 999.0;
+        float clipTimebaseSpanRatio = 0.0f;
+        {
+            const int sw = 256, sh = 128;
+            const float totalShift = 40.0f; // 40 px per timeline frame = 8 px per sub-frame at 5:1
+            auto makeBar = [&](float cx) {
+                std::vector<float> img(static_cast<size_t>(sw) * sh * 4, 0.0f);
+                for (int y = 0; y < sh; ++y) {
+                    for (int x = 0; x < sw; ++x) {
+                        size_t idx = (static_cast<size_t>(y) * sw + x) * 4;
+                        bool inBar = (y >= 32 && y < 96 && std::fabs(x - cx) <= 10.0f);
+                        img[idx + 0] = inBar ? 0.90f : 0.10f;
+                        img[idx + 1] = inBar ? 0.30f : 0.15f;
+                        img[idx + 2] = inBar ? 0.08f : 0.35f;
+                        img[idx + 3] = 1.0f;
+                    }
+                }
+                return img;
+            };
+
+            const float rels[5] = {-0.4f, -0.2f, 0.0f, 0.2f, 0.4f};
+            std::vector<std::vector<float>> subHost(5);
+            std::vector<FrameInput> subCpu(5), subGpu(5);
+            std::vector<uint64_t> subDev(5, 0);
+            const size_t bytes = static_cast<size_t>(sw) * sh * 4 * sizeof(float);
+            for (int j = 0; j < 5; ++j) {
+                subHost[j] = makeBar(128.0f + rels[j] * totalShift);
+                subCpu[j] = {10 + j, subHost[j].data(), 0, nullptr, 0, 0, rels[j]};
+                subDev[j] = CudaEngine::instance().allocDevice(bytes);
+                CudaEngine::instance().uploadToDevice(subDev[j], subHost[j].data(), bytes);
+                subGpu[j] = {10 + j, nullptr, subDev[j], 0, 0, 0, rels[j]};
+            }
+            uint64_t devOut1 = CudaEngine::instance().allocDevice(bytes);
+            uint64_t devOut2 = CudaEngine::instance().allocDevice(bytes);
+            CudaEngine::instance().syncStream(nullptr);
+
+            RenderParams sp;
+            sp.width = sw; sp.height = sh;
+            sp.mode = eModeShutterBlur;
+            sp.flowEngine = eFlowCudaPyramidal;
+            sp.shutterAngle = 180.0f;
+            sp.shutterSamples = 24;
+            sp.shutterTimebase = eTimebaseTimelineFps;
+            sp.timebaseScale = 1.0f;
+
+            FlowCache gc, cc;
+            std::vector<float> gpuOut(sw * sh * 4), cpuOut(sw * sh * 4), gpuClipTbOut(sw * sh * 4);
+            bool okG = CudaEngine::instance().renderFrame(&sp, subGpu, 2, devOut1, sp, gc, nullptr, &subGpu);
+            bool okC = CpuFallbackProcessor::renderFrame(&sp, subCpu, 2, cpuOut.data(), sp, cc, &subCpu);
+
+            RenderParams spClip = sp;
+            spClip.shutterTimebase = eTimebaseClipFps;
+            spClip.timebaseScale = 0.2f; // 24fps / 120fps
+            bool okClip = CudaEngine::instance().renderFrame(&spClip, subGpu, 2, devOut2, spClip, gc, nullptr, &subGpu);
+
+            CudaEngine::instance().downloadFromDevice(gpuOut.data(), devOut1, bytes);
+            CudaEngine::instance().downloadFromDevice(gpuClipTbOut.data(), devOut2, bytes);
+            CudaEngine::instance().syncStream(nullptr);
+
+            for (uint64_t ptr : subDev) CudaEngine::instance().freeDevice(ptr);
+            CudaEngine::instance().freeDevice(devOut1);
+            CudaEngine::instance().freeDevice(devOut2);
+
+            double diffSum = 0.0;
+            for (size_t i = 0; i < gpuOut.size(); ++i) diffSum += std::abs(gpuOut[i] - cpuOut[i]);
+            subGpuCpuDiff = diffSum / gpuOut.size();
+
+            // At x = 128 + 16 (16px from center: inside 180 deg timeline blur [-10-10 .. +10+10], outside 0.2x clip blur [-12 .. +12])
+            float tlR = gpuOut[(64 * sw + 144) * 4 + 0];
+            float clR = gpuClipTbOut[(64 * sw + 144) * 4 + 0];
+            clipTimebaseSpanRatio = tlR - clR;
+            subFrameAndTimebaseOk = okG && okC && okClip && (subGpuCpuDiff < 0.03) && (tlR > 0.25f) && (clR < 0.14f);
+        }
+
+        char t11Buf[384];
+        std::snprintf(t11Buf, sizeof(t11Buf),
+                      "11A(RMSE G=%.4f C=%.4f M=%.4f edge=%.3f ext=%.3f thin=%.3f) | "
+                      "11B(140px EPE N=%.2f P=%.2f) | 11C(curve +y=%.3f/-y=%.3f occ=%.3f) | "
+                      "11D(subDiff=%.4f tbDelta=%.3f)",
+                      rmseGpuNoMatte, rmseCpuNoMatte, rmseGpuMatte,
+                      interiorEdgeR, exteriorRampR, thinBarCenterR,
+                      epe140Neural, epe140Pyr, curvePlusY, curveMinusY, occBlurR,
+                      subGpuCpuDiff, clipTimebaseSpanRatio);
+        report("Test 11: Physical 180 deg Shutter, >120px Flow, Curve/Occlusion & Sub-Frame/Timebase",
+               profileOk && largeDispOk && curveAndOccOk && subFrameAndTimebaseOk, t11Buf);
+    }
+
+    // Test 12: Long-Exposure Curved Arcs, Foreground Matte Isolation, Wake Backfill & Sub-Frame TimeStep
+    {
+        // 12A: Curved circular point-light trail (GPU & CPU) vs straight-line chord
+        bool curveTrailOk = false;
+        float arcMidR = 0.0f, chordInR = 1.0f;
+        double arcGpuCpuDiff = 999.0;
+        {
+            const int cw = 256, ch = 256;
+            const float cx = 128.0f, cy = 128.0f, R = 52.0f, dTheta = 0.55f;
+            const int nF = 5;
+            std::vector<std::vector<float>> seq(nF);
+            std::vector<FrameInput> win(nF);
+            for (int f = 0; f < nF; ++f) {
+                float th = f * dTheta;
+                seq[f] = makePointLightFrame(cw, ch, cx + R * std::cos(th), cy + R * std::sin(th), 5.0f, 1.0f);
+                win[f] = {f, seq[f].data(), 0, nullptr, 0, 0};
+            }
+            RenderParams cp;
+            cp.width = cw; cp.height = ch;
+            cp.mode = eModeLongExposureTrail;
+            cp.flowEngine = eFlowCudaPyramidal;
+            cp.trailFrames = nF;
+            cp.subFrameSteps = 8;
+            cp.trailBlendMode = eTrailLightPainting;
+            cp.motionThreshold = 1.0f;
+            cp.lumaThreshold = 0.15f;
+
+            FlowCache gc, cc;
+            std::vector<float> gpuOut(cw * ch * 4), cpuOut(cw * ch * 4);
+            bool okG = CudaEngine::instance().renderHostFrames(&cp, win, nF - 1, gpuOut.data(), cp, gc);
+            bool okC = CpuFallbackProcessor::renderFrame(&cp, win, nF - 1, cpuOut.data(), cp, cc);
+
+            // Check midpoint between frame 2 and frame 3: true circle at R=52 vs chord interior at R*cos(0.275)*0.88
+            float midTh = 2.5f * dTheta;
+            int ax = static_cast<int>(std::lround(cx + R * std::cos(midTh)));
+            int ay = static_cast<int>(std::lround(cy + R * std::sin(midTh)));
+            int chx = static_cast<int>(std::lround(cx + (R * std::cos(0.5f * dTheta) - 5.0f) * std::cos(midTh)));
+            int chy = static_cast<int>(std::lround(cy + (R * std::cos(0.5f * dTheta) - 5.0f) * std::sin(midTh)));
+            arcMidR = gpuOut[(ay * cw + ax) * 4 + 0];
+            chordInR = gpuOut[(chy * cw + chx) * 4 + 0];
+
+            double diff = 0.0;
+            for (size_t i = 0; i < gpuOut.size(); ++i) diff += std::abs(gpuOut[i] - cpuOut[i]);
+            arcGpuCpuDiff = diff / gpuOut.size();
+            curveTrailOk = okG && okC && (arcMidR > 0.45f) && (arcMidR > chordInR + 0.25f) && (arcGpuCpuDiff < 0.04);
+        }
+
+        // 12B: eMatteForegroundIsolation keeps shaky high-contrast background crisp while trailing foreground
+        bool fgIsoOk = false;
+        float bgMaxSmearPhys = 1.0f, bgMaxSmearLP = 1.0f, fgTrailR = 0.0f;
+        double fgIsoGpuCpuDiff = 999.0;
+        {
+            const int mw = 256, mh = 192;
+            const int nF = 4;
+            std::vector<std::vector<float>> seq(nF), mattes(nF);
+            std::vector<FrameInput> win(nF);
+            for (int f = 0; f < nF; ++f) {
+                seq[f].resize(static_cast<size_t>(mw) * mh * 4);
+                mattes[f].resize(static_cast<size_t>(mw) * mh);
+                float discX = 70.0f + f * 24.0f;
+                float discY = 96.0f;
+                float bgShiftX = f * 8.0f; // camera shake on background
+                for (int y = 0; y < mh; ++y) {
+                    for (int x = 0; x < mw; ++x) {
+                        size_t p = static_cast<size_t>(y) * mw + x;
+                        float d = std::hypot(x - discX, y - discY);
+                        if (d <= 16.0f) {
+                            seq[f][p * 4 + 0] = 0.72f; seq[f][p * 4 + 1] = 0.20f; seq[f][p * 4 + 2] = 0.06f;
+                            mattes[f][p] = 1.0f;
+                        } else {
+                            float stripe = 0.12f + 0.10f * std::sin((x - bgShiftX) * 0.28f) * std::cos(y * 0.15f);
+                            seq[f][p * 4 + 0] = 0.04f; seq[f][p * 4 + 1] = stripe; seq[f][p * 4 + 2] = stripe + 0.16f;
+                            mattes[f][p] = 0.0f;
+                        }
+                        seq[f][p * 4 + 3] = 1.0f;
+                    }
+                }
+                win[f] = {f, seq[f].data(), 0, mattes[f].data(), 0, 1};
+            }
+
+            RenderParams mp;
+            mp.width = mw; mp.height = mh;
+            mp.mode = eModeLongExposureTrail;
+            mp.flowEngine = eFlowCudaPyramidal;
+            mp.matteMode = eMatteForegroundIsolation;
+            mp.trailFrames = nF;
+            mp.subFrameSteps = 6;
+            mp.trailBlendMode = eTrailPhysicalExposure;
+            mp.highlightBoost = 0.0f;
+
+            FlowCache gc1, gc2, cc1;
+            std::vector<float> outPhys(mw * mh * 4), outCpuPhys(mw * mh * 4), outLP(mw * mh * 4);
+            bool okP = CudaEngine::instance().renderHostFrames(&mp, win, nF - 1, outPhys.data(), mp, gc1);
+            bool okCP = CpuFallbackProcessor::renderFrame(&mp, win, nF - 1, outCpuPhys.data(), mp, cc1);
+
+            RenderParams lp = mp;
+            lp.trailBlendMode = eTrailLightPainting;
+            bool okL = CudaEngine::instance().renderHostFrames(&lp, win, nF - 1, outLP.data(), lp, gc2);
+
+            bgMaxSmearPhys = 0.0f; bgMaxSmearLP = 0.0f;
+            for (int y = 16; y < 48; ++y) {
+                for (int x = 16; x < mw - 16; ++x) {
+                    size_t idx = (static_cast<size_t>(y) * mw + x) * 4;
+                    for (int c = 0; c < 3; ++c) {
+                        bgMaxSmearPhys = std::max(bgMaxSmearPhys, std::abs(outPhys[idx + c] - seq[nF - 1][idx + c]));
+                        bgMaxSmearLP = std::max(bgMaxSmearLP, std::abs(outLP[idx + c] - seq[nF - 1][idx + c]));
+                    }
+                }
+            }
+            // Foreground trail left behind at x = 94 (frame 1 disc center) while curr disc is at x = 142
+            fgTrailR = outPhys[(96 * mw + 94) * 4 + 0];
+            double diff = 0.0;
+            for (size_t i = 0; i < outPhys.size(); ++i) diff += std::abs(outPhys[i] - outCpuPhys[i]);
+            fgIsoGpuCpuDiff = diff / outPhys.size();
+            fgIsoOk = okP && okCP && okL && (bgMaxSmearPhys < 1e-3f) && (bgMaxSmearLP < 1e-3f) &&
+                      (fgTrailR > 0.14f) && (fgIsoGpuCpuDiff < 0.02);
+        }
+
+        // 12C: Short-window high-decay wake backfill & sub-frame pairTimeStep Comet scaling
+        bool wakeAndStepOk = false;
+        float wakeR = 1.0f, subStepDecayDiff = 999.0f;
+        {
+            const int ww = 192, wh = 128;
+            auto makeBar = [&](float cx) {
+                std::vector<float> img(static_cast<size_t>(ww) * wh * 4, 0.0f);
+                for (int y = 0; y < wh; ++y) {
+                    for (int x = 0; x < ww; ++x) {
+                        size_t idx = (static_cast<size_t>(y) * ww + x) * 4;
+                        bool inBar = (y >= 32 && y < 96 && std::fabs(x - cx) <= 10.0f);
+                        img[idx + 0] = inBar ? 0.50f : 0.05f;
+                        img[idx + 1] = inBar ? 0.20f : 0.12f;
+                        img[idx + 2] = inBar ? 0.08f : 0.28f;
+                        img[idx + 3] = 1.0f;
+                    }
+                }
+                return img;
+            };
+            auto f0 = makeBar(64.0f), f1 = makeBar(100.0f);
+            std::vector<FrameInput> win = {
+                {0, f0.data(), 0, nullptr, 0, 0},
+                {1, f1.data(), 0, nullptr, 0, 0}
+            };
+            RenderParams wp;
+            wp.width = ww; wp.height = wh;
+            wp.mode = eModeLongExposureTrail;
+            wp.flowEngine = eFlowCudaPyramidal;
+            wp.matteMode = eMatteIgnore;
+            wp.trailFrames = 2;
+            wp.subFrameSteps = 6;
+            wp.trailBlendMode = eTrailCometDecay;
+            wp.trailDecay = 1.0f;
+            wp.rearCurtainCrispness = 0.0f;
+            wp.highlightBoost = 0.0f;
+
+            FlowCache gc1, gc2;
+            std::vector<float> outComet(ww * wh * 4), outSubStep(ww * wh * 4);
+            bool ok1 = CudaEngine::instance().renderHostFrames(&wp, win, 1, outComet.data(), wp, gc1);
+            // At x = 109 (leading edge of curr bar with rearCurtainCrispness=0): acc.w < 0.25 triggers wake backfill from lastRGBA (bg 0.05)
+            wakeR = outComet[(64 * ww + 109) * 4 + 0];
+
+            RenderParams wpSub = wp;
+            wpSub.pairTimeStep = 0.2f;
+            bool ok2 = CudaEngine::instance().renderHostFrames(&wpSub, win, 1, outSubStep.data(), wpSub, gc2);
+            // With 0.2x time step, decay is gentler so x = 76 tail is brighter than 1.0x time step
+            subStepDecayDiff = outSubStep[(64 * ww + 76) * 4 + 0] - outComet[(64 * ww + 76) * 4 + 0];
+            wakeAndStepOk = ok1 && ok2 && (wakeR < 0.38f) && (subStepDecayDiff > 0.02f);
+        }
+
+        char t12Buf[320];
+        std::snprintf(t12Buf, sizeof(t12Buf),
+                      "12A(arcR=%.3f chordInR=%.3f diff=%.4f) | 12B(smearP=%.1e smearL=%.1e fgR=%.3f diff=%.4f) | 12C(wakeR=%.3f subDelta=%.3f)",
+                      arcMidR, chordInR, arcGpuCpuDiff, bgMaxSmearPhys, bgMaxSmearLP, fgTrailR, fgIsoGpuCpuDiff, wakeR, subStepDecayDiff);
+        report("Test 12: Long-Exposure Curved Arcs, Matte Isolation, Wake Backfill & Sub-Frame Step",
+               curveTrailOk && fgIsoOk && wakeAndStepOk, t12Buf);
+    }
+
     // Test 7: Graceful Shutdown & Re-init Cycle
     {
         uint64_t ptr = CudaEngine::instance().allocDevice(4096);

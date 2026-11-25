@@ -24,7 +24,14 @@ public:
         int centerIdx,
         float* dstRGBA,
         const RenderParams& params,
-        FlowCache& cache);
+        FlowCache& cache,
+        const std::vector<FrameInput>* shutterSubFrames = nullptr);
+
+    static bool areFramesDistinct(
+        const float* rgbaA,
+        const float* rgbaB,
+        int width,
+        int height);
 };
 
 } // namespace bmb

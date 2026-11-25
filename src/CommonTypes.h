@@ -28,6 +28,11 @@ enum MatteMode {
     eMatteMaskEffect = 2
 };
 
+enum ShutterTimebase {
+    eTimebaseTimelineFps = 0,
+    eTimebaseClipFps = 1
+};
+
 enum DiagnosticView {
     eViewFinal = 0,
     eViewFlowHSV = 1,
@@ -50,10 +55,17 @@ struct RenderParams {
 
     float shutterAngle = 180.0f;     // 0.0 - 720.0 deg
     float shutterPhase = 0.0f;       // -180.0 - +180.0 deg
+    ShutterTimebase shutterTimebase = eTimebaseTimelineFps;
+    float timebaseScale = 1.0f;      // timelineFps / clipFps when eTimebaseClipFps, else 1.0
+    float fwdFrameStep = 1.0f;       // timeline frame delta from curr to next
+    float bwdFrameStep = 1.0f;       // timeline frame delta from prev to curr
     bool autoShutterSamples = true;  // Tile-adaptive sample count
     int shutterSamples = 48;         // 8 - 64 (max cap when autoShutterSamples is true)
 
     int trailFrames = 8;             // 2 - 24
+    ShutterTimebase trailTimebase = eTimebaseTimelineFps;
+    float pairTimeStep = 1.0f;       // timeline-frame delta per trail pair (<1.0 when sub-frames active)
+    bool isDuplicateFrame = false;   // true on repeated pulldown frames to guard sequentialCache
     int subFrameSteps = 6;           // 1 - 16
     TrailBlendMode trailBlendMode = eTrailPhysicalExposure;
     float trailDecay = 0.35f;        // 0.0 - 1.0
@@ -88,6 +100,7 @@ struct FrameInput {
     const float* hostMatte = nullptr;
     uint64_t deviceMatte = 0; // CUdeviceptr when running on GPU
     int matteComponents = 0; // 1 = Alpha, 4 = RGBA
+    float relTime = 0.0f;    // offset in timeline frames relative to center frame
 };
 
 } // namespace bmb

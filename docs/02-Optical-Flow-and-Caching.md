@@ -6,7 +6,8 @@ Primary files: [CudaEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%2
 ---
 
 ## 1. Shared Pyramids & Conditional Matte Processing
-- `CudaEngine::buildPyramid()` extracts perceptual DW/I luma once at level 0 via `extractLumaAndMatteKernel` (`__ldg` vectorized `float4` reads) and builds up to 5 levels (`>= 16×16`) via `downsample2xKernel`.
+- `CudaEngine::buildPyramid()` extracts perceptual DW/I luma once at level 0 via `extractLumaAndMatteKernel` (`__ldg` vectorized `float4` reads) and builds up to 7 levels (`>= 16×16`, reaching `60×33` at 4K/1080p) via `downsample2xKernel`.
+- `compareFramesKernel` / `CudaEngine::areFramesDistinct()` performs a strided `16×16` pixel comparison (`__syncthreads_or`) to detect duplicate pulldown repeats or verify distinctness of fractional sub-frame probes.
 - Matte pyramids are allocated and downsampled **only** when `matteMode == eMatteForegroundIsolation` and a valid matte buffer is attached (`needMatte == true`).
 - `getOrComputeFlowPairCanonical()` reuses caller-supplied `PyramidSet`s (`pyrCurr` across `(t, t+1)` / `(t, t-1)`, and boundary frame pyramids across consecutive cold misses in Long-Exposure mode) so shared pyramids are built **once** per frame.
 
@@ -16,17 +17,17 @@ Primary files: [CudaEngine.h](file:///c:/Users/pan_y/Documents/Better%20Motion%2
 Executed per pyramid level from coarsest (`numLevels - 1`) down to `finestLevel` (`0` for `eFlowCudaPyramidal`, proxy `~960px` width for `eFlowNeural`):
 - **Shared-Memory Tiling**: Each `16×16` block cooperatively loads a `22×22` `lumaA` tile (and `20×20` `matteA` tile when `hasMatte == 1`) into `__shared__` memory before `__syncthreads()`.
 - **Candidate Evaluation (`evalPatchCostShared`)**:
-  - Evaluates initial upsampled flow, `(0, 0)` static snap, 4 spatial neighbors `{(-2,0), (2,0), (0,-2), (0,2)}` (skipping duplicates), and local `searchRadius` (`5`/`3` at coarsest, `1` at `lvl >= 2`, `0` at fine levels).
+  - Evaluates initial upsampled flow, `(0, 0)` static snap, 4 spatial neighbors `{(-2,0), (2,0), (0,-2), (0,2)}` (skipping duplicates), and local `searchRadius` (`3` for 5-level `512×288`, `5` at coarsest otherwise — supporting `~320 px/frame` at 4K and `~160 px/frame` at 1080p — and `1` at `lvl >= 2`, `0` at fine levels) with `regW = 8e-5` on coarse levels.
   - Uses an integer-displacement fast path (`1` `__ldg` read instead of `4`-tap bilinear) and exact branch-and-bound early exit when `!hasMatte`.
   - Out-of-bounds target coordinates `(ax + vx, ay + vy)` incur a `0.25` penalty rather than clamping borders.
-- **Neighbor Cleanup & Regularization**: At `lvl >= 2`, runs a second zero-radius neighbor-propagation cleanup pass (`lkIters = 2`) to eliminate isolated coarse outliers, followed by `jointBilateralFlowFilterKernel` (`20×20` shared-memory tile).
+- **Neighbor Cleanup & Regularization**: At `lvl >= 2`, runs a second zero-radius neighbor-propagation cleanup pass (`lkIters = 2`) to eliminate isolated coarse outliers, followed by `jointBilateralFlowFilterKernel` (`20×20` shared-memory tile) using DW/I-calibrated `sigmaRange = 0.012 + (1 - flowDetail) * 0.055`.
 - **Sub-Pixel Iterative LK**: Computes `valA`, `gx`, `gy`, and weights once per pixel during structure-tensor assembly and reuses them across `lkIterations` (`4` coarse, `5` fine) with Charbonnier/Huber weighting and backtracking cost guard.
 
 ---
 
 ## 3. Neural Proxy Flow (`eFlowNeural`) & Upsampling
 At `finestLevel` (`lvl = 2` for `>= 2560px`, `lvl = 1` for `>= 1024px`, `lvl = 0` for `< 1024px`):
-1. **`correlationFlowKernel`**: Preloads a `3×3` `lumaA` patch into registers and performs a `5×5` half-pixel correlation search with exact branch-and-bound early exit.
+1. **`correlationFlowKernel`**: Preloads a `3×3` `lumaA` patch into registers, performs a `5×5` half-pixel correlation search with exact branch-and-bound early exit, and applies 1D parabolic sub-pixel interpolation across the 4 cardinal half-pixel neighbors.
 2. **Residual Flow Refinement**:
    - **GPU-Native Fast Path (Default)**: When no external `neuflow_v2.onnx` file is loaded (`!NeuralFlowEngine::instance().isUsingExternalModel()`), `embeddedResidualRefineKernel` evaluates `refined = flow + 0.08 * Laplacian_3x3(flow)` directly in an `18×18` shared-memory tile — algebraically identical to `buildResidualFlowRefinementOnnx()` with zero PCIe transfer or stream sync.
    - **External ONNX Path**: If `Contents/Resources/neuflow_v2.onnx` or `Contents/Win64/models/neuflow_v2.onnx` exists, `NeuralFlowEngine` loads Resolve's `onnxruntime.dll` (ORT 1.13.1 C API vtable slots). During `initialize()`, files `<= 64 KB` are byte-compared against `buildResidualFlowRefinementOnnx()`; if byte-identical, `m_usingExternalModel` remains `false` so `CudaEngine` runs the GPU-native `embeddedResidualRefineKernel` with zero sync/PCIe overhead, while genuine custom external models run `refineFlow` via persistent host staging buffers.

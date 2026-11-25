@@ -5,6 +5,20 @@
 
 <!-- FROZEN_PUSHED_HISTORY -->
 
+## [v1.2.0] - 2026-11-25
+### Added
+- **Shutter Timebase (`shutterTimebase`), Trail Timebase (`trailTimebase`) & Sub-Frame / Pulldown Handling**: Added `Timeline FPS` vs `Source Clip FPS` selectors for both Shutter Blur and Long-Exposure Trail, automatic duplicate-frame skipping for lower-FPS clips on higher-FPS timelines (`areFramesDistinct`, including `SequentialTrailState` repeat guard), and fractional sub-frame probing (`clipFps > timelineFps`) with piecewise Voronoi linear-DWG shutter integration and milli-frame-keyed sub-frame trail splatting.
+- **Test 11 & Test 12**: Added physical 180° 64-subframe camera ground-truth comparison, 1080p `140 px/frame` optical flow accuracy, curved exterior arc, single-sided occlusion, multi-subframe/`eTimebaseClipFps` verification (`Test 11`), plus Long-Exposure curved circular arc, `eMatteForegroundIsolation` background non-smearing, short-window wake backfill, and `pairTimeStep` Comet scaling (`Test 12`).
+
+### Fixed & Changed
+- **Long-Exposure Trail Upgrades (`CudaEngine` & `CpuFallbackProcessor`)**:
+  - Added time-invariant confidence-gated quadratic curved splatting in `trailPairSplatMovingKernel` and `CpuFallbackProcessor` using `pairFlows[k + 1]` ($t_{k-1} \to t_{k-2}$), eliminating polygonal kinks on arcs while preserving `TrailSplatCache` invariance.
+  - Added `eMatteForegroundIsolation` (`matteMode == 1`) emission gating on `matteA` and crisp background compositing (`bgW = max(0, totalWindowW - acc.w)`), plus short-window wake backfill (`acc.w < 0.25`) from `lastRGBA`.
+- **Physical 180° Shutter Reconstruction (`CudaEngine` & `CpuFallbackProcessor`)**:
+  - Replaced background-discarding `wSample` renormalization with physically normalized foreground/background integration (`fgFrac` + `bgFrac` with unoccluded `centerLin` fallback and Jacobian weighting) so silhouettes taper smoothly (`100% -> 50% -> 0%`) and thin fast subjects turn semi-transparent.
+  - Added confidence-weighted bidirectional velocity/acceleration (`evalConfWeightedVelAcc` using `confFwd`/`confBwd`) to prevent 50% velocity loss at single-sided occlusions, corrected inverse gather kinematics (`-v * tau - 0.5 * a * tau^2`), carried acceleration `aDom` into separable dynamic-radius `neighborMaxVelH/V` (`tileRadius` up to `12` tiles), and sampled `prevRGBA`/`nextRGBA` for true temporal disocclusion behind moving edges.
+  - Expanded optical flow pyramid to `7` levels (`~320 px/frame` search at 4K, `~160 px/frame` at 1080p), calibrated DW/I joint-bilateral `sigmaRange = 0.012 + (1 - flowDetail) * 0.055`, and added 1D parabolic sub-pixel refinement in `correlationFlowKernel`.
+
 ## [v1.1.0] - 2026-11-21
 ### Added
 - **Tile-Adaptive Shutter Samples (`autoShutterSamples`)**: Enabled by default; dynamically scales `synthesizeShutterBlurKernel` and `CpuFallbackProcessor` sample counts per `16×16` tile using `neighborMax` velocity (`clamp(ceil(domSpeed * shutterSpan * 1.25), min(samples, 8), samples)`), using `shutterSamples` (default `48`) as the upper cap with zero CUDA intra-warp divergence.

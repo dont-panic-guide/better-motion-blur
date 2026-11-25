@@ -51,6 +51,15 @@ public:
         uint64_t devOutputRGBA,
         const RenderParams& params,
         FlowCache& cache,
+        void* stream = nullptr,
+        const std::vector<FrameInput>* shutterSubFrames = nullptr);
+
+    // Checks whether two GPU RGBA frames differ (used for pulldown/sub-frame probing).
+    bool areFramesDistinct(
+        uint64_t devFrameA,
+        uint64_t devFrameB,
+        int width,
+        int height,
         void* stream = nullptr);
 
     // Convenience helper for standalone tests using host RGBA float buffers.
@@ -82,7 +91,7 @@ private:
     };
 
     struct PyramidSet {
-        static constexpr int kMaxLevels = 5;
+        static constexpr int kMaxLevels = 7;
         int numLevels = 0;
         int lw[kMaxLevels] = {};
         int lh[kMaxLevels] = {};
@@ -108,6 +117,21 @@ private:
         int width, int height,
         FlowEngineType engineType, float flowDetail, MatteMode matteMode,
         uint64_t devOutFlow2, void* stream);
+
+    bool renderSingleShutterPass(
+        const void* instanceId,
+        const FrameInput* prevF,
+        const FrameInput& currF,
+        const FrameInput* nextF,
+        PyramidSet* pyrPrev,
+        PyramidSet* pyrCurr,
+        PyramidSet* pyrNext,
+        uint64_t devCurrMatte,
+        int hasMatte,
+        uint64_t targetBuf,
+        const RenderParams& params,
+        FlowCache& cache,
+        void* stream);
 
     FlowPairResult getOrComputeFlowPairCanonical(
         const void* instanceId,
@@ -158,9 +182,13 @@ private:
     void* m_fnJointBilateralFilter = nullptr;
     void* m_fnJointBilateralUpsample = nullptr;
     void* m_fnPackBidirectional = nullptr;
+    void* m_fnCompareFrames = nullptr;
     void* m_fnTileMaxVel = nullptr;
-    void* m_fnNeighborMaxVel = nullptr;
+    void* m_fnNeighborMaxVelH = nullptr;
+    void* m_fnNeighborMaxVelV = nullptr;
     void* m_fnShutterBlur = nullptr;
+    void* m_fnAccumLinearFromDwi = nullptr;
+    void* m_fnEncodeLinearToDwi = nullptr;
     void* m_fnTrailPairInitStatic = nullptr;
     void* m_fnTrailPairSplatMoving = nullptr;
     void* m_fnTrailCompositeAndFinalize = nullptr;
